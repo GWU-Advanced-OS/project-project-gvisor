@@ -11,6 +11,7 @@
 
 
 ## Sam Frey
+#### [Platform Guide](https://gvisor.dev/docs/architecture_guide/platforms/)
 - Platform
     - ptrace
         - uses [PTRACE_SYSEMU](https://man7.org/linux/man-pages/man2/ptrace.2.html) to execute code without allowing sys calls to the host.
