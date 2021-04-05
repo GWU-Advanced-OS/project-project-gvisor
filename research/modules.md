@@ -13,8 +13,13 @@
 ## Sam Frey
 #### [What is gVisor](https://gvisor.dev/docs/)
 - runsc executable
+    - implements [Open Container Initiative (OCI)](https://www.opencontainers.org/) runtime spec
+        - Also used by Docker and Kubernetes
+    - Capable of running any OCI compatible bundle
+        - OCI bundle includes container config JSON file and a root filesystem for the container
     - entry point to container
-    - Also used by Docker and Kubernetes
+    - Implements commands for starting, stopping, listing, and querying the status of containers.
+
 - Sentry
     - Largest component
     - Acts as application kernel
