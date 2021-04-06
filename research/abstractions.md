@@ -23,6 +23,12 @@
         - works directly with host or within a VM with nested virtualizatoin enabled.
         - Still a process-based model, but uses virtualization extentions on modern hardware for improved isolation and performance.
 
+#### [Resource Model](https://gvisor.dev/docs/architecture_guide/resources/)
+- Processes
+    - A gVisor sandbox appears as one process on the host systems
+    - Processes within the sandbox are not managed as individual host processes
+        - process-level interactions with the sandbox require being in the sandbox (i.e. [docker exec](https://docs.docker.com/engine/reference/commandline/exec/)).
+
 
 ## Will Daughtridge
 
