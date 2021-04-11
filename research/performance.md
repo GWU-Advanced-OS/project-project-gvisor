@@ -2,7 +2,7 @@
 
 ## Jack Umina
 
-[The True Cost of Containing: A gVisor Case Study - Young](https://www.usenix.org/system/files/hotcloud19-paper-young.pdf)
+[The True Cost of Containing: A gVisor Case Study - Young](https://github.com/GWU-Advanced-OS/project-project-gvisor/blob/main/research/performance-res/true-cost-containing-young.pdf)
 
 #### gVisor takes a performance hit for...
 - syscall heavy workloads
@@ -16,6 +16,49 @@
 - Reading small files 11x slower
 - Downloading large files 2.8x slower
 - Negatively affects high level operations like importing Python modules
+
+[gVisor.dev - Performace Guide](https://gvisor.dev/docs/architecture_guide/performance/)
+
+#### Memory Overhead 
+- No additional memory overhead for raw accesses once initial mappings are installed through Sentry
+- Sentry uses a small, fixed amount of memory to track state of the application
+
+[Security-Performance Trade-offs of Kubernetes Container Runtimes - Viktorsson](https://github.com/GWU-Advanced-OS/project-project-gvisor/blob/main/research/performance-res/security-performace-tradeoffs-viktorsson.pdf)
+
+### Performance Experiment between Redis, Spark, and TeaStore
+
+Experiment was conducted using gVisor running on pTrace.
+
+#### Applications Tested
+
+1. **TeaStore:**
+ - Microservice bencmark that emulates a web store.
+ - Includes features such as browsing, selecting, and ordering tea.
+ - *Throughput* measured based on average requests per second using a mix of the eight different API operations.
+2. **Redis**
+ - "An in memory data-store featuring data structures such as hashes, lists, sets, and more."
+ - *Throughput* measured using request per second of the O(1) GET operation.
+3. **Spark**
+ - "A distributed general purpose computing framework for big data processing."
+ - *Throughput* measured as the average amount of primes found per second when finding all prime numbers in the first million numbers.
+
+#### Results
+
+![Results of TeaStore - Redis - Spark Experiment](https://github.com/GWU-Advanced-OS/project-project-gvisor/blob/main/research/performance-res/redis-spark-teastore-experiment.png)
+
+##### Deployment Time (gVisor compared to runc)
+- **TeaStore:** About 3 times longer
+- **Spark** About 3 times longer
+- **Redis** Almost twice as long
+
+##### Throughput (gVisor compared to runc)
+- **TeaStore:** About 40-60% throughput of runc
+- **Spark** About 40-60% throughput of runc
+- **Redis** About 20% throughput of runc
+  - Redis score is based on a simple GET request which is neither CPU nor memory demanding and rather networking intensive. gVisor struggles with networking as its netstack still requires significant developement.
+
+##### Overhead
+- gVisor imposes a 14 MB memory overhead compared to runc
 
 ## Jake Cannizzaro
 
