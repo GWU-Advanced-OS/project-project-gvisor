@@ -44,8 +44,6 @@ Experiment was conducted using gVisor running on pTrace.
 
 #### Results
 
-![Results of TeaStore - Redis - Spark Experiment](https://github.com/GWU-Advanced-OS/project-project-gvisor/blob/main/research/performance-res/redis-spark-teastore-experiment.png)
-
 ##### Deployment Time (gVisor compared to runc)
 - **TeaStore:** About 3 times longer
 - **Spark** About 3 times longer
@@ -62,6 +60,20 @@ Experiment was conducted using gVisor running on pTrace.
 
 [Blending Containers and Virtual Machines: A Study of Firecracker and gVisor - Anjali](https://github.com/GWU-Advanced-OS/project-project-gvisor/blob/main/research/performance-res/blending-containers-vms-anjali.pdf)
 
+#### Experiment Setup
+- Tests performace across four configurations: host Linux with no isolation, Linux containers (LXC), and gVisor (using KVM-mode)
+
+#### Memory Allocation
+- Sentry in gVisor uses a two-level page table
+- **Calls to** `do_mmap()` **function in** `mm/mmap.c`:
+  - gVisor: 5,382 times
+  - LXC: more than 1 million times
+- Seems like Sentry makes mmap calls down to kernel for large chunks of memory and then Senty breaks these chunks into smaller pieces. *(TODO: Find code to substantiate claim)*
+- **Memory allocation comparison:**
+  - Time compared for making succesive mmap calls and unmap calls of varying sizes for a total of 1GB
+  - 4KB pieces: gVisor is about 16 times slower
+  - 64KB pieces: gVisor is about 8-10 times slower
+  - Gap between gVisor closes as mmap size increases, likely due to Senty two-level page table
 
 ## Jake Cannizzaro
 
