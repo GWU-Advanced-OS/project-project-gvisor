@@ -7,7 +7,18 @@
 
 
 ## Jon Terry
+* utilizes much of host kernel for networking despite having its own netstack specifically because they wanted to isolate networking from the host OS
+    * "Despite having an in-Sentry networking stack (including TCP, UDP,IP4, IP6 and ICMP), gVisor has the highest overall coverage and surprisingly exercises much 
+		of the same code as LXC under/net." (1)
+* executes pretty much the same host OS kernel code as Linux Containers despite having its own implementation of the OS
+    * "The code coverage analysis shows that despite moving much operating system functionality out of the kernel,
+		both gVisor and Firecracker execute substantially more Linux kernel code than native Linux alone, and that 
+		much of the code executed is not in different functions,but rather conditional code within the same functions executed by native Linux." (1)
+* seccomp filters installed to control what system calls can be made - kills process if invalid call is made
+    * "Install generates BPF code based on the set of syscalls provided. It only allows syscalls that conform to the specification. Syscalls that violate the specification will trigger RET_KILL_PROCESS" (code comments)
 
+
+(1): Ending Containers and Virtual Machines: A Study of Firecracker and gVisor - Anjali, Caraza-Harter, Swift
 
 
 ## Sam Frey
