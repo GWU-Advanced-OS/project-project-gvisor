@@ -60,6 +60,9 @@ Experiment was conducted using gVisor running on pTrace.
 ##### Overhead
 - gVisor imposes a 14 MB memory overhead compared to runc
 
+[Blending Containers and Virtual Machines: A Study of Firecracker and gVisor - Anjali](https://github.com/GWU-Advanced-OS/project-project-gvisor/blob/main/research/performance-res/blending-containers-vms-anjali.pdf)
+
+
 ## Jake Cannizzaro
 
 
