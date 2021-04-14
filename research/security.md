@@ -70,6 +70,20 @@ https://gvisor.dev/docs/architecture_guide/security/
 * generally no external importing in core pkgs
     * utmost control is needed for security
 
+### example creation of net stack for sentry
+```go
+// NewTestStack returns a TestStack with no network interfaces. The value of
+// all other options is unspecified; tests that rely on specific values must
+// set them explicitly.
+func NewTestStack() *TestStack {
+	return &TestStack{
+		InterfacesMap:     make(map[int32]Interface),
+		InterfaceAddrsMap: make(map[int32][]InterfaceAddr),
+	}
+}
++
+```
+
 ### doSyscall - entry point for user app made syscalls
 ```go
 // doSyscall is the entry point for an invocation of a system call specified by
