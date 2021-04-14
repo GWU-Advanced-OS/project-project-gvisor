@@ -17,7 +17,7 @@
 #### Security
 - seccomp whitelists 55 syscalls for Sentry; restricts applications to 211 of 300+ syscalls. Sentry implements those 211 calls using just its 55 allowed calls.
 
-- Sentry doesn't pass system calls directly to the host kernel.
+- Sentry doesn't pass system calls directly to the host kernel from user application in sandbox.
 
 - Other than system calls made to the host by Sentry, the sandbox runs exclusively in user level.
 
