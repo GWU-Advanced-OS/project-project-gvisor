@@ -69,3 +69,215 @@ https://gvisor.dev/docs/architecture_guide/security/
     * no CGo
 * generally no external importing in core pkgs
     * utmost control is needed for security
+
+### doSyscall - entry point for user app made syscalls
+```go
+// doSyscall is the entry point for an invocation of a system call specified by
+// the current state of t's registers.
+//
+// The syscall path is very hot; avoid defer.
+func (t *Task) doSyscall() taskRunState {
+	// Save value of the register which is clobbered in the following
+	// t.Arch().SetReturn(-ENOSYS) operation. This is dedicated to arm64.
+	//
+	// On x86, register rax was shared by syscall number and return
+	// value, and at the entry of the syscall handler, the rax was
+	// saved to regs.orig_rax which was exposed to userspace.
+	// But on arm64, syscall number was passed through X8, and the X0
+	// was shared by the first syscall argument and return value. The
+	// X0 was saved to regs.orig_x0 which was not exposed to userspace.
+	// So we have to do the same operation here to save the X0 value
+	// into the task context.
+	t.Arch().SyscallSaveOrig()
+
+	sysno := t.Arch().SyscallNo()
+	args := t.Arch().SyscallArgs()
+
+	// Tracers expect to see this between when the task traps into the kernel
+	// to perform a syscall and when the syscall is actually invoked.
+	// This useless-looking temporary is needed because Go.
+	tmp := uintptr(unix.ENOSYS)
+	t.Arch().SetReturn(-tmp)
+
+	// Check seccomp filters. The nil check is for performance (as seccomp use
+	// is rare), not needed for correctness.
+	if t.syscallFilters.Load() != nil {
+		switch r := t.checkSeccompSyscall(int32(sysno), args, hostarch.Addr(t.Arch().IP())); r {
+		case linux.SECCOMP_RET_ERRNO, linux.SECCOMP_RET_TRAP:
+			t.Debugf("Syscall %d: denied by seccomp", sysno)
+			return (*runSyscallExit)(nil)
+		case linux.SECCOMP_RET_ALLOW:
+			// ok
+		case linux.SECCOMP_RET_KILL_THREAD:
+			t.Debugf("Syscall %d: killed by seccomp", sysno)
+			t.PrepareExit(ExitStatus{Signo: int(linux.SIGSYS)})
+			return (*runExit)(nil)
+		case linux.SECCOMP_RET_TRACE:
+			t.Debugf("Syscall %d: stopping for PTRACE_EVENT_SECCOMP", sysno)
+			return (*runSyscallAfterPtraceEventSeccomp)(nil)
+		default:
+			panic(fmt.Sprintf("Unknown seccomp result %d", r))
+		}
+	}
+
+	return t.doSyscallEnter(sysno, args)
+}
+```
+
+### interesting discussion about sentry intercepting syscalls
+* https://groups.google.com/g/gvisor-users/c/15FfcCilupo/m/9ARSLnH3BQAJ
+* sentry can run in ring0 and ring3
+
+### diagram for syscall flow from app
+https://github.com/google/gvisor/blob/master/pkg/sentry/kernel/g3doc/run_states.png
+
+### architecture diagram
+* following picture displays sentry as intermediary layer between application and host kernel
+https://github.com/google/gvisor/blob/master/g3doc/Sentry-Gofer.png
+
+### example linux syscall (pipe) implemented in sentry
+```go
+// pipe2 implements the actual system call with flags.
+func pipe2(t *kernel.Task, addr hostarch.Addr, flags uint) (uintptr, error) {
+	if flags&^(linux.O_NONBLOCK|linux.O_CLOEXEC) != 0 {
+		return 0, syserror.EINVAL
+	}
+	r, w := pipe.NewConnectedPipe(t, pipe.DefaultPipeSize)
+
+	r.SetFlags(linuxToFlags(flags).Settable())
+	defer r.DecRef(t)
+
+	w.SetFlags(linuxToFlags(flags).Settable())
+	defer w.DecRef(t)
+
+	fds, err := t.NewFDs(0, []*fs.File{r, w}, kernel.FDFlags{
+		CloseOnExec: flags&linux.O_CLOEXEC != 0,
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	if _, err := primitive.CopyInt32SliceOut(t, addr, fds); err != nil {
+		for _, fd := range fds {
+			if file, _ := t.FDTable().Remove(t, fd); file != nil {
+				file.DecRef(t)
+			}
+		}
+		return 0, err
+	}
+	return 0, nil
+}
+```
+
+### sentry checking for capabilities, and not exposing to an application if they don't
+```go
+// CapError gives a syscall function that checks for capability c.  If the task
+// has the capability, it returns ENOSYS, otherwise EPERM. To unprivileged
+// tasks, it will seem like there is an implementation.
+func CapError(name string, c linux.Capability, note string, urls []string) kernel.Syscall {
+	if note != "" {
+		note = note + "; "
+	}
+	return kernel.Syscall{
+		Name: name,
+		Fn: func(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+			if !t.HasCapability(c) {
+				return 0, nil, syserror.EPERM
+			}
+			t.Kernel().EmitUnimplementedEvent(t)
+			return 0, nil, syserror.ENOSYS
+		},
+		SupportLevel: kernel.SupportUnimplemented,
+		Note:         fmt.Sprintf("%sReturns %q if the process does not have %s; %q otherwise.", note, syserror.EPERM, c.String(), syserror.ENOSYS),
+		URLs:         urls,
+	}
+}
+```
+
+### watchdog code implementation
+```go
+// runTurn runs a single pass over all tasks and reports anything it finds.
+func (w *Watchdog) runTurn() {
+	// Someone needs to watch the watchdog. The call below can get stuck if there
+	// is a deadlock affecting root's PID namespace mutex. Run it in a goroutine
+	// and report if it takes too long to return.
+	var tasks []*kernel.Task
+	done := make(chan struct{})
+	go func() { // S/R-SAFE: watchdog is stopped and restarted during S/R.
+		tasks = w.k.TaskSet().Root.Tasks()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(w.TaskTimeout):
+		// Report if the watchdog is not making progress.
+		// No one is watching the watchdog watcher though.
+		w.reportStuckWatchdog()
+		<-done
+	}
+
+	newOffenders := make(map[*kernel.Task]*offender)
+	newTaskFound := false
+	now := ktime.FromNanoseconds(int64(w.k.CPUClockNow() * uint64(linux.ClockTick)))
+
+	// The process may be running with low CPU limit making tasks appear stuck because
+	// are starved of CPU cycles. An estimate is that Tasks could have been starved
+	// since the last time the watchdog run. If the watchdog detects that scheduling
+	// is off, it will discount the entire duration since last run from 'lastUpdateTime'.
+	discount := time.Duration(0)
+	if now.Sub(w.lastRun.Add(w.period)) > descheduleThreshold {
+		discount = now.Sub(w.lastRun)
+	}
+	w.lastRun = now
+
+	log.Infof("Watchdog starting loop, tasks: %d, discount: %v", len(tasks), discount)
+	for _, t := range tasks {
+		tsched := t.TaskGoroutineSchedInfo()
+
+		// An offender is a task running inside the kernel for longer than the specified timeout.
+		if tsched.State == kernel.TaskGoroutineRunningSys {
+			lastUpdateTime := ktime.FromNanoseconds(int64(tsched.Timestamp * uint64(linux.ClockTick)))
+			elapsed := now.Sub(lastUpdateTime) - discount
+			if elapsed > w.TaskTimeout {
+				tc, ok := w.offenders[t]
+				if !ok {
+					// New stuck task detected.
+					//
+					// Note that tasks blocked doing IO may be considered stuck in kernel,
+					// unless they are surrounded b
+					// Task.UninterruptibleSleepStart/Finish.
+					tc = &offender{lastUpdateTime: lastUpdateTime}
+					stuckTasks.Increment()
+					newTaskFound = true
+				}
+				newOffenders[t] = tc
+			}
+		}
+	}
+	if len(newOffenders) > 0 {
+		w.report(newOffenders, newTaskFound, now)
+	}
+
+	// Remember which tasks have been reported.
+	w.offenders = newOffenders
+}
+
+// report takes appropriate action when a stuck task is detected.
+func (w *Watchdog) report(offenders map[*kernel.Task]*offender, newTaskFound bool, now ktime.Time) {
+	var buf bytes.Buffer
+	buf.WriteString(fmt.Sprintf("Sentry detected %d stuck task(s):\n", len(offenders)))
+	for t, o := range offenders {
+		tid := w.k.TaskSet().Root.IDOfTask(t)
+		buf.WriteString(fmt.Sprintf("\tTask tid: %v (goroutine %d), entered RunSys state %v ago.\n", tid, t.GoroutineID(), now.Sub(o.lastUpdateTime)))
+	}
+	buf.WriteString("Search for 'goroutine <id>' in the stack dump to find the offending goroutine(s)")
+
+	// Force stack dump only if a new task is detected.
+	w.doAction(w.TaskTimeoutAction, newTaskFound, &buf)
+}
+```
+
+```go
+
+```
