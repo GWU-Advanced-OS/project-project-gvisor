@@ -90,6 +90,28 @@ The next part of the Gofer sandboxing involves `chroot`ing the process to `/root
 
 ##### 9p
 Gofer acts as the file server for the running gVisor containers. This means each container is a client that must request files from it. After sandboxing the Gofer process, a list of p9 attachers is allocated. Then, beginning with `/`, an attach point is created for every mount point specified in the spec file. This is done using the `fsgofer` package, which implements Plan 9 file giving access. After installing the seccomp filters, `runServers()` is called to, you guessed it, run the servers. As well as holding the mount points necessary for the container, the specfile holds a list of `ioFD`s which are file descriptors used to connect to 9P servers. Iterating through the list of associated `ioFD`s and attachment points, a goroutine (concurrently executed functions) is started to  is create a new socket for each `ioFD`, and a new p9 server for each attachment point. `Handle()` is then called on each attachment point, passing the associated socket. `Handle()` is located within `gvisor/pkg/p9/server.go`. Through a few levels of indirection within the same file, `Handle()` begins the process of infinitely looping until further requests aren't needed, some error occurs, or an error in another goroutine occurs, which signals a shutdown/exit signal for the thread.
+```
+func runServers(ats []p9.Attacher, ioFDs []int) {
+	// Run the loops and wait for all to exit.
+	var wg sync.WaitGroup
+	for i, ioFD := range ioFDs {
+		wg.Add(1)
+		go func(ioFD int, at p9.Attacher) {
+			socket, err := unet.NewSocket(ioFD)
+			if err != nil {
+				Fatalf("creating server on FD %d: %v", ioFD, err)
+			}
+			s := p9.NewServer(at)
+			if err := s.Handle(socket); err != nil {
+				Fatalf("P9 server returned error. Gofer is shutting down. FD: %d, err: %v", ioFD, err)
+			}
+			wg.Done()
+		}(ioFD, ats[i])
+	}
+	wg.Wait()
+	log.Infof("All 9P servers exited.")
+}
+```
 
 
 
