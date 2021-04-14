@@ -23,6 +23,7 @@ To use the tmpfs overlay, add the following runtimeArgs to your Docker configura
 This will allow the Gofer process to use the fs outside the root of the sandbox but not the other way around. If one needs more than one instance to have access to the directory, a shared command can be used to allow access from outside the container. This is done by adding `"--file-access=shared"` to the `runtimeArgs` section shown above.
 
 #### Diving in to the [code](https://github.com/google/gvisor):
+##### Security
 Starting at [runsc/cmd/gofer.go](https://github.com/google/gvisor/blob/master/runsc/cmd/gofer.go) ---
 Gofer uses golang [subcommands](https://github.com/google/subcommands) so that when the program is run, additional arguments can be set to set parameters within the code. These arguments populate the `Gofer` struct.
 ```
@@ -44,7 +45,7 @@ The main logic of this program begins with `Execute()`. It begins by populating 
 ... maybe above gets too specific...moving on for now...
 Setting up the root filesystem:
 `func setupRootFS(spec *specs.Spec, conf *config.Config) error {`
-This function first turns all shared mounts into slave mounts so that changes can propagate into the shared mounts but not outside of the namespace into the host. This mount command uses the `MS_SLAVE` and `MS_REC` to accomplish this so that every mount under "/" becomes a slave. Next, the root needs to be mounted on a new `tmpfs` filesystem. `runsc` requires a `/proc` directory so it is done here. Under `/proc`, new directories `/proc/proc` and `/proc/root` are created to give a location for the sandbox root. The new `/proc/proc` is mounted with the following flags for to prevent any attempts to break out of the isolated sandbox:
+This function first turns all shared mounts into slave mounts so that changes can propagate into the shared mounts but not outside of the namespace into the host. This mount command uses the `MS_SLAVE` and `MS_REC` to accomplish this so that every mount under "/" becomes a slave. Next, the root needs to be mounted on a new `tmpfs` filesystem. `runsc` requires a `/proc` directory so the `tmpfs` is mounted here. Under `/proc`, new directories `/proc/proc` and `/proc/root` are created to give a location for the sandbox root. The new `/proc/proc` is mounted with the following flags for to prevent any attempts to break out of the isolated sandbox:
 - MS_RDONLY
     - don't allow process to write changes.
 - MS_NOSUID
@@ -62,8 +63,9 @@ The Gofer process's root is then mounted on the new `/proc/root` with the source
 - MS_REC
     - Recursively propagate these mount options to all subdirectories of the mount point.
 
-Once the initial filesystem has been created, `setupMounts()` and `resolveSymlinks()` are called to bind all mounts specified in the spec file as well as changing any relative paths and symlinks so that they point to their new locations within the sandbox. Depending on the spec, the new root filesystem can be remounted read only for extra protection. At this point the filesystem is set up but still in some subdirectory of the process's view of the namespace. `pivotRoot()` is called to actually make the newly created root the process's root. After this, the process is sandboxed and cannot access the host filesystem.
-After setting up the process's file system, capabilities are set with goferCaps:
+Once the initial filesystem has been created, `setupMounts()` and `resolveSymlinks()` are called to bind all mounts specified in the spec file as well as changing any relative paths and symlinks so that they point to their new locations within the sandbox. Depending on the spec, the new root filesystem can be remounted read only for extra protection. At this point the filesystem is set up but still in some subdirectory of the process's view of the namespace. `pivotRoot()` is called to actually make `/proc` the process's root directory. This essentially changes the process's view of the filesystem its mounted on. After this, the process is on the way to being sandboxed and cannot access the host filesystem.
+
+After setting up the process's file system, process capabilities are set with goferCaps:
 ```
 var caps = []string{
 	"CAP_CHOWN",
@@ -83,6 +85,13 @@ var goferCaps = &specs.LinuxCapabilities{
 }
 ```
 Limiting the process's capabilities to this set bounds the permitted set of capabilities for the process to prevent it from having more privilege than needed. See the [capabilities manual page](https://man7.org/linux/man-pages/man7/capabilities.7.html) to to see just how many capabilities there are in linux and why it makes sense to limit them in this way.
+
+The next part of the Gofer sandboxing involves `chroot`ing the process to `/root`. Note after calling `pivot_root()`, `/proc` became `/` in the process's filesystem. Now the process is `chroot`ed to what was originally created as `/proc/root`, which now in the processes view is the new `/`. This adds an extra layer of isolation by further jailing the process one subdirectory down. The following section will go over setting up the 9p protocol used to serve files to the container. The last layer of protection added to this Gofer process is added after that setup. That is installing seccomp filters, utilizing BPF instructions, in order to whitelist and limit the allowed system calls allowed by the process.
+
+##### 9p
+Gofer acts as the file server for the running gVisor containers. This means each container is a client that must request files from it. After sandboxing the Gofer process, a list of p9 attachers is allocated. Then, beginning with `/`, an attach point is created for every mount point specified in the spec file. This is done using the `fsgofer` package, which implements Plan 9 file giving access. After installing the seccomp filters, `runServers()` is called to, you guessed it, run the servers. As well as holding the mount points necessary for the container, the specfile holds a list of `ioFD`s which are file descriptors used to connect to 9P servers. Iterating through the list of associated `ioFD`s and attachment points, a goroutine (concurrently executed functions) is started to  is create a new socket for each `ioFD`, and a new p9 server for each attachment point. `Handle()` is then called on each attachment point, passing the associated socket. `Handle()` is located within `gvisor/pkg/p9/server.go`. Through a few levels of indirection within the same file, `Handle()` begins the process of infinitely looping until further requests aren't needed, some error occurs, or an error in another goroutine occurs, which signals a shutdown/exit signal for the thread.
+
+
 
 
 ## Jon Terry
