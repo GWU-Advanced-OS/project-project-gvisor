@@ -86,7 +86,57 @@ Limiting the process's capabilities to this set bounds the permitted set of capa
 
 
 ## Jon Terry
+#### Platform:
+- KVM:
+    - handles setting up page tables for VMs, switching between guest user, guest OS, and sentry
+    - handles creation of VMs and memory allocation for them
+        - fills host address space with PROT_NONE mappings up to the size of the guest physical address space
+    - system calls caught by KVM, calls ring0.WriteFS(FS_base_register)
+        -ring0 contains defintions for exceptions stubs, vector maps for exception handlers, redirects for syscalls and exceptions, page table handling, and context switches
+        ```
+        func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
+			userCR3 := switchOpts.PageTables.CR3(!switchOpts.Flush, switchOpts.UserPCID)
+			c.kernelCR3 = uintptr(c.kernel.PageTables.CR3(true, switchOpts.KernelPCID))
+        ```
+- ptrace:
+    - When new address space created, creates child process with single thread which is traced by a single goroutine
+    - calling switch on context:
+        - locks runtime thread
+        - looks up traced subprocess thread for current runtime thread, creates new stopped thread in subprocess if none exists, subprocess traced by current thread.
+        - requested operation is performed in traced subprocess
+    - when subprocesses are released, they're unmappped and released to globalPool rather than being killed
+        - can't kill them on call to release() because the thread can't exit until all tracers have been notified and the tracers are random runtime threads
+        - global pool also has a master subprocess utilized for installing seccomp filters
+        - when new subprocess requested, either one from the globalPool can be returned or a new one can be created and returned if there aren't any in globalPool to return
+    ```
+            func newSubprocess(create func() (*thread, error)) (*subprocess, error) {
+        // See Release.
+        globalPool.mu.Lock()
+        if len(globalPool.available) > 0 {
+            sp := globalPool.available[len(globalPool.available)-1]
+            globalPool.available = globalPool.available[:len(globalPool.available)-1]
+            globalPool.mu.Unlock()
+            return sp, nil
+        }
+        globalPool.mu.Unlock()
 
+        // The following goroutine is responsible for creating the first traced
+        // thread, and responding to requests to make additional threads in the
+        // traced process. The process will be killed and reaped when the
+        // request channel is closed, which happens in Release below.
+        errChan := make(chan error)
+        requests := make(chan chan *thread)
+    ```
+
+    - subprocess is a collection of threads being traced
+        - has sysemuThreads pool reserved for emulation, syscallThreads pool resserved for syscalls, a mutex, set of contexts who's pointer might be to this subprocess
+            -contexts contain:
+                -signal and interrupt info
+                - pointer to the subprocess that was executing when fault occured (lastFaultSP)
+                - faulting address
+                - faulting instruction pointer
+    - syscall() takes syscall number and args, creates new subprocess (or gets one from globalPool), sets up registers and calls thread.syscall() which executes the system call in a traced context (passes ptrace arguments to unix system call), then restores the registers
+        - actually goes to host kernel, ptrace in kernel then forwards the syscalls to the sentry
 
 
 ## Sam Frey
