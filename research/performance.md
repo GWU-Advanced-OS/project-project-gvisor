@@ -2,6 +2,72 @@
 
 ## Jack Umina
 
+### `mmap()` Stack Trace
+
+When an application running in gVisor calls `mmap()`, first the `Mmap()` syscall is invoked:
+```
+// Line 42 of sys_mmap.go
+func Mmap(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error)
+```
+- `t` is a Task that represents an execution thread in an un-trusted app
+  - This includes registers and any thread-specific state
+- `SyscallArguments` include the length of the memory region requested and a pointer to the memory
+  - These arguments get stored in a `MMapOpts` object
+
+From here, `MMap()` is invoked in Sentry.
+
+``` go
+// Line 75 of syscalls.go
+func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostarch.Addr, error) {
+```
+- Takes in a `Context` and `MMapOpts` as arguments
+  - `Context` is the execution thread that called mmap  
+
+Inside of `MMap()`, `createVMALocked` is called on line 122 which is where a new memory region is actually created.
+
+``` go
+// Line 33 of vma.go
+func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOpts) (vmaIterator, hostarch.AddrRange, error) {
+
+    // ...
+    // Line 55    
+
+    // Check against RLIMIT_AS.
+    newUsageAS := mm.usageAS + opts.Length
+    if opts.Unmap {
+        newUsageAS -= uint64(mm.vmas.SpanRange(ar))
+    }
+    if limitAS := limits.FromContext(ctx).Get(limits.AS).Cur; newUsageAS > limitAS {
+        return vmaIterator{}, hostarch.AddrRange{}, syserror.ENOMEM
+    }
+
+    if opts.MLockMode != memmap.MLockNone {
+        // Check against RLIMIT_MEMLOCK.
+        if creds := auth.CredentialsFromContext(ctx); !creds.HasCapabilityIn(linux.CAP_IPC_LOCK, creds.UserNamespace.Root()) {
+            mlockLimit := limits.FromContext(ctx).Get(limits.MemoryLocked).Cur
+            if mlockLimit == 0 {
+                return vmaIterator{}, hostarch.AddrRange{}, syserror.EPERM
+            }
+            newLockedAS := mm.lockedAS + opts.Length
+            if opts.Unmap {
+                newLockedAS -= mm.mlockedBytesRangeLocked(ar)
+            }
+            if newLockedAS > mlockLimit {
+                return vmaIterator{}, hostarch.AddrRange{}, syserror.EAGAIN
+            }
+        }
+    }
+
+    // ...
+}
+```
+- Again takes a `Context` and the same `MMapOpts` as parameters
+- Finds a mappable region of memory to allocate
+- Checks the permissions of the `Context` to see if it can access this region and can allocate more memory
+- Creates the VMA
+- Returns the address to the region
+
+
 [The True Cost of Containing: A gVisor Case Study - Young](https://github.com/GWU-Advanced-OS/project-project-gvisor/blob/main/research/performance-res/true-cost-containing-young.pdf)
 
 #### gVisor takes a performance hit for...
@@ -17,11 +83,16 @@
 - Downloading large files 2.8x slower
 - Negatively affects high level operations like importing Python modules
 
-[gVisor.dev - Performace Guide](https://gvisor.dev/docs/architecture_guide/performance/)
+[gVisor.dev](https://gvisor.dev/docs/architecture_guide/)
 
 #### Memory Overhead 
 - No additional memory overhead for raw accesses once initial mappings are installed through Sentry
 - Sentry uses a small, fixed amount of memory to track state of the application
+
+#### Memory Allocation
+- "In order to avoid excessive overhead, the Sentry does not demand-page individual pages. Instead, it selects appropriate regions based on heuristics. There is a trade-off here: the Sentry is unable to trivially determine which pages are active and which are not. Even if pages were individually faulted, the host may select pages to be reclaimed or swapped without the Sentry’s knowledge."
+- Sentry implements a two level page table system
+- First, a large region is requested from the host which is later sliced into smaller pieces to be used by applications inside the sandbox
 
 [Security-Performance Trade-offs of Kubernetes Container Runtimes - Viktorsson](https://github.com/GWU-Advanced-OS/project-project-gvisor/blob/main/research/performance-res/security-performace-tradeoffs-viktorsson.pdf)
 
