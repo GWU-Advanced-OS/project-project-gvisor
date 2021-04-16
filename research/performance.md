@@ -2,10 +2,116 @@
 
 ## Jack Umina
 
-### `mmap()` Stack Trace
+### Memory Allocation Stack Trace 
+
+#### From Host to Sentry
+
+Sentry requests large chunks of memory from the host OS and zeros out the mem. This is not immediately made available to the applications running in gvisor, rather, Sentry holds on to the memory and later divides it further when requested by an applicaton.
+
+``` go
+// Line 381 of pgalloc.go
+// Allocate returns a range of initially-zeroed pages of the given length with
+// the given accounting kind and a single reference held by the caller. When
+// the last reference on an allocated page is released, ownership of the page
+// is returned to the MemoryFile, allowing it to be returned by a future call
+// to Allocate.
+//
+// Preconditions: length must be page-aligned and non-zero.
+func (f *MemoryFile) Allocate(length uint64, kind usage.MemoryKind) (memmap.FileRange, error) {
+
+    // ...
+
+    // Align hugepage-and-larger allocations on hugepage boundaries to try
+    // to take advantage of hugetmpfs.
+    alignment := uint64(hostarch.PageSize)
+    if length >= hostarch.HugePageSize {
+        alignment = hostarch.HugePageSize
+    }
+
+    // Find a range in the underlying file.
+    fr, ok := findAvailableRange(&f.usage, f.fileSize, length, alignment)
+    if !ok {
+        return memmap.FileRange{}, syserror.ENOMEM
+    }
+
+    // ...
+
+    if f.opts.ManualZeroing {
+        if err := f.manuallyZero(fr); err != nil {
+            return memmap.FileRange{}, err
+        }
+    }
+    // Mark selected pages as in use.
+    if !f.usage.Add(fr, usageInfo{
+        kind: kind,
+        refs: 1,
+    }) {
+        panic(fmt.Sprintf("allocating %v: failed to insert into usage set:\n%v", fr, &f.usage))
+    }
+
+    return fr, nil
+}
+```
+
+``` go
+// Line 441 of pgalloc.go
+// findAvailableRange returns an available range in the usageSet.
+//
+// Note that scanning for available slots takes place from end first backwards,
+// then forwards. This heuristic has important consequence for how sequential
+// mappings can be merged in the host VMAs, given that addresses for both
+// application and sentry mappings are allocated top-down (from higher to
+// lower addresses). The file is also grown expoentially in order to create
+// space for mappings to be allocated downwards.
+//
+// Precondition: alignment must be a power of 2.
+func findAvailableRange(usage *usageSet, fileSize int64, length, alignment uint64) (memmap.FileRange, bool) {
+    alignmentMask := alignment - 1
+
+    // Search for space in existing gaps, starting at the current end of the
+    // file and working backward.
+    lastGap := usage.LastGap()
+    gap := lastGap
+    for {
+        end := gap.End()
+        if end > uint64(fileSize) {
+            end = uint64(fileSize)
+        }
+
+        // Try to allocate from the end of this gap, with the start of the
+        // allocated range aligned down to alignment.
+        unalignedStart := end - length
+        if unalignedStart > end {
+            // Negative overflow: this and all preceding gaps are too small to
+            // accommodate length.
+            break
+        }
+        if start := unalignedStart &^ alignmentMask; start >= gap.Start() {
+            return memmap.FileRange{start, start + length}, true
+        }
+
+        gap = gap.PrevLargeEnoughGap(length)
+        if !gap.Ok() {
+            break
+        }
+    }
+
+    // Check that it's possible to fit this allocation at the end of a file of any size.
+    min := lastGap.Start()
+    min = (min + alignmentMask) &^ alignmentMask
+    if min+length < min {
+        // Overflow: allocation would exceed the range of uint64.
+        return memmap.FileRange{}, false
+    }
+
+    // ...
+}
+```
+
+#### From Sentry to Application
 
 When an application running in gVisor calls `mmap()`, first the `Mmap()` syscall is invoked:
-```
+``` go
 // Line 42 of sys_mmap.go
 func Mmap(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error)
 ```
@@ -28,6 +134,17 @@ Inside of `MMap()`, `createVMALocked` is called on line 122 which is where a new
 ``` go
 // Line 33 of vma.go
 func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOpts) (vmaIterator, hostarch.AddrRange, error) {
+
+    // ...
+    // Line 38
+
+    // Find a usable range.
+    addr, err := mm.findAvailableLocked(opts.Length, findAvailableOpts{
+        Addr:     opts.Addr,
+        Fixed:    opts.Fixed,
+        Unmap:    opts.Unmap,
+        Map32Bit: opts.Map32Bit,
+    })
 
     // ...
     // Line 55    
@@ -66,6 +183,11 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 - Checks the permissions of the `Context` to see if it can access this region and can allocate more memory
 - Creates the VMA
 - Returns the address to the region
+
+
+#### Tradeoffs of gVisor's Memory Allocation
+Due to the double level page table system, applications requesting small pieces of memory (relative to the size requested from the host by Sentry) suffer in performace. As the size of the memory requested by an application increases, the performance increases. However, it should be noted that memory allocation of any size is not very fast in gvisor relative native Linux containers.
+*See studies below quantifying this performance*
 
 
 [The True Cost of Containing: A gVisor Case Study - Young](https://github.com/GWU-Advanced-OS/project-project-gvisor/blob/main/research/performance-res/true-cost-containing-young.pdf)
