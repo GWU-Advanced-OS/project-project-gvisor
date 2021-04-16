@@ -119,9 +119,75 @@ func runServers(ats []p9.Attacher, ioFDs []int) {
 ## Jon Terry
 #### Platform:
 - KVM:
-    - handles setting up page tables for VMs, switching between guest user, guest OS, and sentry
+    - handles setting up page tables for VMs, switching between guest user and guest OS
+        - machine.go's SwitchToUser() in /pkg/ring0 calls entersyscall() followed by bluepill(c) where c is the current vCPU
+            - bluepill.go:
+
+            ```
+            // bluepill enters guest mode.
+            func bluepill(*vCPU)
+            ```
+
+            - bluepill_unsafe.go:
+            ```
+            func bluepillHandler(context unsafe.Pointer) {
+                // Sanitize the registers; interrupts must always be disabled.
+                c := bluepillArchEnter(bluepillArchContext(context))
+
+                // Mark this as guest mode.
+                switch atomic.SwapUint32(&c.state, vCPUGuest|vCPUUser) {
+            ```
+            - this contrasts with the ptrace platform since KVM directly handles context switches from system calls. In ptrace the call made to the host OS in ptrace mode and then ptrace redirects it
+    - handles allocation and mapping of guest physical memory
+        - physicalInit() (/platform/kvm/physical_map.go) calls fillAddressSpace which "fills the host address space with PROT_NONE mappings until we have a host address space size that is less than or equal to the physical address space." and computes guest physical regions of memory.
+
+            ```
+            // physicalInit initializes physical address mappings.
+            func physicalInit() {
+                physicalRegions = computePhysicalRegions(fillAddressSpace())
+            }
+            ```
+
+            ```
+            for filled := uintptr(0); filled < required && current > 0; {
+            addr, _, errno := unix.RawSyscall6(
+                unix.SYS_MMAP,
+                0, // Suggested address.
+                current,
+                unix.PROT_NONE,
+                unix.MAP_ANONYMOUS|unix.MAP_PRIVATE|unix.MAP_NORESERVE,
+                0, 0)
+            ```
+        - VM sets up page tables for guest virtual to guest physical mappings based off the physical regions computed from the host virtual memory
+        ```
+        // Apply the physical mappings. Note that these mappings may point to
+	    // guest physical addresses that are not actually available. These
+	    // physical pages are mapped on demand, see kernel_unsafe.go.
+	    applyPhysicalRegions(func(pr physicalRegion) bool {
+        ```
     - handles creation of VMs and memory allocation for them
         - fills host address space with PROT_NONE mappings up to the size of the guest physical address space
+    - handles page faults in VMs 
+        - if bluepillHandler gets a page fault it passes in the ptr to the VM, the physical address of the fault, and physicalRegions which is a list of available physical memory regions (guest physical). The fault handler first gets the virstual and physical addresses for the fault address range, then gets the next available memory slot for the VM and creates a new user memory region with the new slot, guest physical address and guest virtual address and makes a system call to set the new region as user memory
+     ```
+    func (m *machine) setMemoryRegion(slot int, physical, length, virtual uintptr, flags uint32) unix.Errno {
+        userRegion := userMemoryRegion{
+            slot:          uint32(slot),
+            flags:         uint32(flags),
+            guestPhysAddr: uint64(physical),
+            memorySize:    uint64(length),
+            userspaceAddr: uint64(virtual),
+        }
+
+        // Set the region.
+        _, _, errno := unix.RawSyscall(
+            unix.SYS_IOCTL,
+            uintptr(m.fd),
+            _KVM_SET_USER_MEMORY_REGION,
+            uintptr(unsafe.Pointer(&userRegion)))
+        return errno
+    }
+     ```
     - system calls caught by KVM, calls ring0.WriteFS(FS_base_register)
         -ring0 contains defintions for exceptions stubs, vector maps for exception handlers, redirects for syscalls and exceptions, page table handling, and context switches
         ```
