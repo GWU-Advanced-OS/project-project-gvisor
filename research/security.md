@@ -27,7 +27,7 @@
 
 ## Will Daughtridge
 
-https://gvisor.dev/docs/architecture_guide/security/
+### https://gvisor.dev/docs/architecture_guide/security/
 
 ### exposure
 * layered defense to protect against system API exploits
@@ -70,19 +70,7 @@ https://gvisor.dev/docs/architecture_guide/security/
 * generally no external importing in core pkgs
     * utmost control is needed for security
 
-### example creation of net stack for sentry
-```go
-// NewTestStack returns a TestStack with no network interfaces. The value of
-// all other options is unspecified; tests that rely on specific values must
-// set them explicitly.
-func NewTestStack() *TestStack {
-	return &TestStack{
-		InterfacesMap:     make(map[int32]Interface),
-		InterfaceAddrsMap: make(map[int32][]InterfaceAddr),
-	}
-}
-+
-```
+
 
 ### doSyscall - entry point for user app made syscalls
 ```go
@@ -142,12 +130,18 @@ func (t *Task) doSyscall() taskRunState {
 * https://groups.google.com/g/gvisor-users/c/15FfcCilupo/m/9ARSLnH3BQAJ
 * sentry can run in ring0 and ring3
 
-### diagram for syscall flow from app
-https://github.com/google/gvisor/blob/master/pkg/sentry/kernel/g3doc/run_states.png
+### nice blog post describing overall security with good references at bottom
+* https://gvisor.dev/blog/2019/11/18/gvisor-security-basics-part-1/
 
-### architecture diagram
+### diagrams, some more diagrams, and, you guessed it, more diagrams
 * following picture displays sentry as intermediary layer between application and host kernel
-https://github.com/google/gvisor/blob/master/g3doc/Sentry-Gofer.png
+	* https://github.com/google/gvisor/blob/master/g3doc/Sentry-Gofer.png
+* more colorful diagrams
+	* https://gvisor.dev/assets/images/2019-11-18-security-basics-figure1.png
+* syscall path
+	* https://github.com/google/gvisor/blob/master/pkg/sentry/kernel/g3doc/run_states.png
+* net related
+	* https://gvisor.dev/assets/images/2020-04-02-networking-security-figure1.png
 
 ### example linux syscall (pipe) implemented in sentry
 ```go
@@ -292,6 +286,78 @@ func (w *Watchdog) report(offenders map[*kernel.Task]*offender, newTaskFound boo
 }
 ```
 
+### code example of ptrace subprocess being attached to tracked thread
 ```go
+// attach attaches to the thread.
+func (t *thread) attach() {
+	if _, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE, syscall.PTRACE_ATTACH, uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
+		panic(fmt.Sprintf("unable to attach: %v", errno))
+	}
+
+	// PTRACE_ATTACH sends SIGSTOP, and wakes the tracee if it was already
+	// stopped from the SIGSTOP queued by CLONE_PTRACE (see inner loop of
+	// newSubprocess), so we always expect to see signal-delivery-stop with
+	// SIGSTOP.
+	if sig := t.wait(stopped); sig != syscall.SIGSTOP {
+		panic(fmt.Sprintf("wait failed: expected SIGSTOP, got %v", sig))
+	}
+
+	// Initialize options.
+	t.init()
+}
+```
+
+### test code example showing error being thrown if "application" makes syscall
+```go
+applicationTest(t, true, testutil.SyscallLoop, func(c *vCPU, regs *arch.Registers, pt *pagetables.PageTables) bool {
+	var si arch.SignalInfo
+	if _, err := c.SwitchToUser(ring0.SwitchOpts{
+		Registers:          regs,
+		FloatingPointState: &dummyFPState,
+		PageTables:         pt,
+		FullRestore:        true,
+	}, &si); err == platform.ErrContextInterrupt {
+		return true // Retry.
+	} else if err != nil {
+		t.Errorf("application syscall with full restore failed: %v", err)
+	}
+	return false
+})
+```
+* and relavent snippet from SwitchToUser with the logic case
+```go
+switch vector {
+	case ring0.Syscall, ring0.SyscallInt80:
+		// Fast path: system call executed.
+		return hostarch.NoAccess, nil
+```
+
+### sentry communicates with host for syscalls via a userspace network stack
+* code that creates new endpoint socket for netstack in entry
+```go
+// New creates a new endpoint socket.
+func New(t *kernel.Task, family int, skType linux.SockType, protocol int, queue *waiter.Queue, endpoint tcpip.Endpoint) (*fs.File, *syserr.Error) {
+	if skType == linux.SOCK_STREAM {
+		endpoint.SocketOptions().SetDelayOption(true)
+	}
+
+	dirent := socket.NewDirent(t, netstackDevice)
+	defer dirent.DecRef(t)
+	return fs.NewFile(t, dirent, fs.FileFlags{Read: true, Write: true, NonSeekable: true}, &SocketOperations{
+		socketOpsCommon: socketOpsCommon{
+			Queue:    queue,
+			family:   family,
+			Endpoint: endpoint,
+			skType:   skType,
+			protocol: protocol,
+		},
+	}), nil
 
 ```
+* https://gvisor.dev/blog/2020/04/02/gvisor-networking-security/
+
+### gVisor not vulnerable to found networking ring buffer issue
+* https://gvisor.dev/blog/2020/09/18/containing-a-real-vulnerability/
+* bug allowed for attacker to overflow a ring buffer when 'reserving' space in buffer for next packet
+* docker is susceptible to bug as they needed to implement CAP_NET_RAW (reason for issue) due to ```ping``` and ```tcpdump```
+* gVisor does not enable raw sockets by default, needs admin to enable in init spec 
