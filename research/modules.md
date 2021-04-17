@@ -88,7 +88,7 @@ Limiting the process's capabilities to this set bounds the permitted set of capa
 
 The next part of the Gofer sandboxing involves `chroot`ing the process to `/root`. Note after calling `pivot_root()`, `/proc` became `/` in the process's filesystem. Now the process is `chroot`ed to what was originally created as `/proc/root`, which now in the processes view is the new `/`. This adds an extra layer of isolation by further jailing the process one subdirectory down. The following section will go over setting up the 9p protocol used to serve files to the container. The last layer of protection added to this Gofer process is added after that setup. That is installing seccomp filters, utilizing BPF instructions, in order to whitelist and limit the allowed system calls allowed by the process.
 
-##### 9p
+##### 9p / Server Model
 Gofer acts as the file server for the running gVisor containers. This means each container is a client that must request files from it. After sandboxing the Gofer process, a list of p9 attachers is allocated. Then, beginning with `/`, an attach point is created for every mount point specified in the spec file. This is done using the `fsgofer` package, which implements Plan 9 file giving access. After installing the seccomp filters, `runServers()` is called to, you guessed it, run the servers. As well as holding the mount points necessary for the container, the specfile holds a list of `ioFD`s which are file descriptors used to connect to 9P servers. Iterating through the list of associated `ioFD`s and attachment points, a goroutine (concurrently executed functions) is started to  is create a new socket for each `ioFD`, and a new p9 server for each attachment point. `Handle()` is then called on each attachment point, passing the associated socket. `Handle()` is located within `gvisor/pkg/p9/server.go`. Through a few levels of indirection within the same file, `Handle()` begins the process of infinitely looping until further requests aren't needed, some error occurs, or an error in another goroutine occurs, which signals a shutdown/exit signal for the thread.
 ```
 func runServers(ats []p9.Attacher, ioFDs []int) {
@@ -113,7 +113,11 @@ func runServers(ats []p9.Attacher, ioFDs []int) {
 }
 ```
 
+As shown above, to begin, the gofer creates one goroutine per client connection and calls `Handle()`. `Handle()` creates a connection state for the given connection and calls `handleRequests()`. This method is a simple wrapper that just infinitely calls `handleRequest()` until an error is thrown or the goroutine receives the shutdown signal. `handleRequest()` "handles" the main logic of dealing with client connections.
 
+Before moving on to handling the connections, a brief aside is necessary to understand the threading model of the Gofer server. [Goroutines](https://tour.golang.org/concurrency/1) are lightweight threads managed by the Go runtime. Within gVisor's [resource model documentation](https://gvisor.dev/docs/architecture_guide/resources/), it is explained that threading is a lightweight "green thread". See this [paper](https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.8.9238&rep=rep1&type=pdf) comparing Linux Threads to Green Threads. This paper explains green threads in the Java runtime but the concept applies here as well for the Go runtime (Go's resource model itself links a wikipedia article which sources a paper talking about Java green threads). Green threads are a userspace thread implementation that don't need a backing kernel thread. In this model, green threads are mapped to a single task and can be managed with little overhead. This is in contrast to the system calls required with linux threads. Thread activation also takes less overhead because Linux threads must create a corresponding execution entity within the kernel. When latency is important for an application, it is recommended for threads to be created at initialization rather than on demand.
+
+more coming... going to hmart... hopefully tonight... maybe tomorrow...
 
 
 ## Jon Terry
@@ -167,7 +171,7 @@ func runServers(ats []p9.Attacher, ioFDs []int) {
         ```
     - handles creation of VMs and memory allocation for them
         - fills host address space with PROT_NONE mappings up to the size of the guest physical address space
-    - handles page faults in VMs 
+    - handles page faults in VMs
         - if bluepillHandler gets a page fault it passes in the ptr to the VM, the physical address of the fault, and physicalRegions which is a list of available physical memory regions (guest physical). The fault handler first gets the virstual and physical addresses for the fault address range, then gets the next available memory slot for the VM and creates a new user memory region with the new slot, guest physical address and guest virtual address and makes a system call to set the new region as user memory
      ```
     func (m *machine) setMemoryRegion(slot int, physical, length, virtual uintptr, flags uint32) unix.Errno {
