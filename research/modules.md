@@ -113,11 +113,99 @@ func runServers(ats []p9.Attacher, ioFDs []int) {
 }
 ```
 
-As shown above, to begin, the gofer creates one goroutine per client connection and calls `Handle()`. `Handle()` creates a connection state for the given connection and calls `handleRequests()`. This method is a simple wrapper that just infinitely calls `handleRequest()` until an error is thrown or the goroutine receives the shutdown signal. `handleRequest()` "handles" the main logic of dealing with client connections.
+As shown above, to begin, the gofer creates one goroutine (to begin with, more can be added as necessary) per client connection and calls `Handle()`. `Handle()` creates a connection state for the given connection and calls `handleRequests()`. This method is a simple wrapper that just infinitely calls `handleRequest()` until an error is thrown or the goroutine receives the shutdown signal. `handleRequest()` "handles" the main logic of dealing with client connections.
 
 Before moving on to handling the connections, a brief aside is necessary to understand the threading model of the Gofer server. [Goroutines](https://tour.golang.org/concurrency/1) are lightweight threads managed by the Go runtime. Within gVisor's [resource model documentation](https://gvisor.dev/docs/architecture_guide/resources/), it is explained that threading is a lightweight "green thread". See this [paper](https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.8.9238&rep=rep1&type=pdf) comparing Linux Threads to Green Threads. This paper explains green threads in the Java runtime but the concept applies here as well for the Go runtime (Go's resource model itself links a wikipedia article which sources a paper talking about Java green threads). Green threads are a userspace thread implementation that don't need a backing kernel thread. In this model, green threads are mapped to a single task and can be managed with little overhead. This is in contrast to the system calls required with linux threads. Thread activation also takes less overhead because Linux threads must create a corresponding execution entity within the kernel. When latency is important for an application, it is recommended for threads to be created at initialization rather than on demand.
 
-more coming... going to hmart... hopefully tonight... maybe tomorrow...
+In Gofer, the goroutines used to handle client requests represent a many-to-one model where many userspace goroutines correspond to one actual OS thread. They can be spun up as necessary depending on the demand of the client connection to the sentry. Back to `handleRequest()` in `gvisor/pkg/p9/server.go`. This method has a critical section as letting multiple threads attempt to modify the same structures in the given connection state could cause unexpected behavior and errors. Therefore, the first thing a goroutine does when entering this function is attempt to take the mutex for the connections state:
+```
+atomic.AddInt32(&cs.recvIdle, 1)
+cs.recvMu.Lock()
+atomic.AddInt32(&cs.recvIdle, -1)
+```
+The atomic add instructions on either side of the lock let all goroutines associated with the given connection keep track of the number of idle threads waiting to enter the critical section. The `.Lock()` method above goes to `Lock()` in `gvisor/pkg/sync/mutex_unsafe.go` which then calls `Lock()` in `/usr/local/go/src/sync/mutex.go`:
+```
+// Lock locks m.
+// If the lock is already in use, the calling goroutine
+// blocks until the mutex is available.
+func (m *Mutex) Lock() {
+	// Fast path: grab unlocked mutex.
+	if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
+		if race.Enabled {
+			race.Acquire(unsafe.Pointer(m))
+		}
+		return
+	}
+	// Slow path (outlined so that the fast path can be inlined)
+	m.lockSlow()
+}
+```
+You can see an interesting optimization here where the fast path assumes the mutex is free and inlines that logic in the function. If the mutex is taken, `lockSlow()` is implemented in a different function because the blocking mechanism takes more logic so it is slow pathed.
+
+Back to `server.go` - `handleRequest()`. The next step is to recieve the message from the client:
+```
+// Receive a message.
+tag, m, err := recv(cs.conn, messageSize, msgRegistry.get)
+if errSocket, ok := err.(ErrSocket); ok {
+    // Connection problem; stop serving.
+    log.Debugf("p9.recv: %v", errSocket.error)
+    cs.recvShutdown = true
+    cs.recvMu.Unlock()
+    return false
+}
+```
+`recv()` in `gvisor/pkg/p9/transport.go`:
+```
+// recv decodes a message from the socket.
+// This is done in two parts, and is thus not safe for multiple callers.
+// On a socket error, the special error type ErrSocket is returned.
+// The tag value NoTag will always be returned if err is non-nil.
+func recv(s *unet.Socket, msize uint32, lookup lookupTagAndType) (Tag, message, error) {
+```
+As you can see in the comments above the method, this method is unsafe for multiple callers, hence the mutex used above. This method then calls `ReadVec()` in `gvisor/pkg/unet/unet_unsafe.go`. This method reads into pre-allocated buffers. Another interesting optimization is found in this method. This is the main read loop of the method:
+```
+for {
+    var e unix.Errno
+
+    // Try a non-blocking recv first, so we don't give up the go runtime M.
+    n, _, e = unix.RawSyscall(unix.SYS_RECVMSG, uintptr(fd), uintptr(unsafe.Pointer(&msg)), unix.MSG_DONTWAIT|unix.MSG_TRUNC)
+    if e == 0 {
+        break
+    }
+    if e == unix.EINTR {
+        continue
+    }
+    if !r.blocking {
+        r.socket.gate.Leave()
+        return 0, e
+    }
+    if e != unix.EAGAIN && e != unix.EWOULDBLOCK {
+        r.socket.gate.Leave()
+        return 0, e
+    }
+
+    // Wait for the socket to become readable.
+    err := r.socket.wait(false)
+    if err == errClosing {
+        err = unix.EBADF
+    }
+    if err != nil {
+        r.socket.gate.Leave()
+        return 0, err
+    }
+}
+```
+Consider two cases, a busy stream over the connection and a sparse stream of data. This loop first attempts a nonblocking receive to handle the client request immediately. On a busy stream of data, this will give instant responses to the client without any blocking necessary. However, if the client socket has nothing incomming, this goroutine will simply wait on the socket to have data. In this way, the gofer server implements a both non-blocking and blocking implementation to handle requests as soon as possible. When the goroutine ends up back in `handleRequest()`, assuming no errors...
+```
+// Ensure that another goroutine is available to receive from cs.conn.
+if atomic.LoadInt32(&cs.recvIdle) == 0 {
+    go cs.handleRequests() // S/R-SAFE: Irrelevant.
+}
+cs.recvMu.Unlock()
+```
+... the goroutine spawns another goroutine (on the same connection state `cs`) to handle the next request from the client as it finishes handling the current one and sending a response. That if statement checks to see if another goroutine is already waiting to take the mutex above, and if so, doesn't need to spawn a new one because as soon as this one unlocks and releases the mutex, that one will come into the critical section to handle the next response. Assuming the goroutines can quickly process and send responses to the clients, this thread pool will never grow too large and will simply reuse the same small set of goroutines per connection.
+
+
 
 
 ## Jon Terry
