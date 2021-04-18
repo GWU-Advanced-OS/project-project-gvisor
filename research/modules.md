@@ -23,7 +23,9 @@ To use the tmpfs overlay, add the following runtimeArgs to your Docker configura
 This will allow the Gofer process to use the fs outside the root of the sandbox but not the other way around. If one needs more than one instance to have access to the directory, a shared command can be used to allow access from outside the container. This is done by adding `"--file-access=shared"` to the `runtimeArgs` section shown above.
 
 Diagram of overlayfs:
+
 ![overlayfs_diagram](overlay_constructs.jpg)
+
 The above image shows three layers. The bottom layer is the root directory of the application to be run and sandboxed by gVisor. This is called the `lowerdir` and represents the directory on the host OS. The container is mounted on `upperdir` and `merged`. `merged` is a slave mount, meaning that changes in the `lowerdir` will propogate towards `merged` but not the other way around. `merged` appears to be a full image/filesystem to the container. This is possible because any changes or additions to the filesystem are stored in `upperdir` so it still appears to have full access and control of its filesystem. This is useful because the container can make any changes and use the image at will without having to copy the entire directory into a new sandboxed filesystem.
 
 
