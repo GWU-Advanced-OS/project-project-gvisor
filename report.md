@@ -132,8 +132,112 @@ In the KVM implementation, guest applications are simply represented as a ```con
 While the Ptrace implementation of context switches also maintains similar data to KVM in a ```context``` data structure, the tracing of guest applications necessitates a subprocess to trace threads. Host threads are created depending on the number of active guest applications within a sandbox. A subprocess is a collection of traced threads, consisting of a pool of threads reserved for emulation, one reserved for system calls. The need to trace the execution of threads necessitates these subprocesses and complicates context switches in this platform. In order to switch to a given context the current runtime thread must be locked, then Ptrace must find the traced subprocess for this runtime thread and then perform the operation in this traced subprocess.
 
 While the Ptrace implementation of the platform offers more general compatability than KVM, the necessities of tracing thread execution complicate the operations supported by the platform. In addition to the added complexity of having traced subprocesses backing guest threads, the way in which Ptrace handles system call redirection to the Sentry results in higher overhead than KVM, having the effect of decreasing the practical applications of Ptrace-mode gVisor.
-.
+
+### Sentry
+The Sentry is the largest component of gVisor. It acts an a kernel to any application running in the sandbox. When an application running in the sandbox makes a system call, that system call is first intercepted by the Platform, then passed to the Sentry. Using a limited set of 55 host system calls, the Sentry implements 211 system calls for sandboxed applications. System calls are never passed directly from a sandboxed application to the host kernel. If possible, the Sentry will handle the call without making any system calls to the host. For system calls related to filesystem access, the Sentry makes requests Gofer using the 9P protocol. Other than system calls made to the host by Sentry, the sandbox runs exclusively in user level.
+
 ## Abstractions (and code examples showing implementation with type defs)
+
+### Threads and Processes
+Because gVisor runs its own kernel via the Sentry, a gVisor sandbox appears as a single process to the host system, regardless of how many processes are running within the sandbox. The Sentry creates a `Task` struct for each thread of execution within the sandbox. These `Task`s are dispatched as a `goroutine`, a many-to-one user-space thread model provided by the Go language and can be bundled together into a `TaskSet` to support multithreaded applications. `Task`s are scheduled by the Sentry and unknown to the host. The Sentry can create host threads as needed to support a varying volume of `Task`s running in the sandbox. A subset of the `Task` struct definition can be seen below. Similar to a `proc`, it includes fields for state, size of memory, scheduling, mutexes, filesystem context, priority, and cpu assignment. Source: [gvisor/pkg/sentry/kernel/task.go](https://github.com/google/gvisor/blob/8ad6657a22b0eaaef7d1b4a31553e826a87e9190/pkg/sentry/kernel/task.go#L58)
+```go
+type Task struct {
+	taskNode
+	
+    //task goroutine's ID
+    goid int64 `state:"nosave"`
+
+	// runState is what the task goroutine is executing if it is not stopped.
+	// If runState is nil, the task goroutine should exit or has exited.
+	// runState is exclusive to the task goroutine.
+	runState taskRunState
+
+	// current scheduling state of the task goroutine.
+	// gosched is protected by goschedSeq. gosched is owned by the task goroutine.
+	goschedSeq sync.SeqCount `state:"nosave"`
+	gosched    TaskGoroutineSchedInfo
+
+	// p provides the mechanism by which the task runs code in userspace. The p
+	// interface object is immutable.
+	p platform.Context `state:"nosave"`
+
+	// k is the Kernel that this task belongs to. The k pointer is immutable.
+	k *Kernel
+
+	// mu protects some of the following fields.
+	mu sync.Mutex `state:"nosave"`
+
+	// fsContext is the task's filesystem context.
+	// fsContext is protected by mu, and is owned by the task goroutine.
+	fsContext *FSContext
+
+	// fdTable is the task's file descriptor table.
+	// fdTable is protected by mu, and is owned by the task goroutine.
+	fdTable *FDTable
+
+	// ipcns is the task's IPC namespace.
+	// ipcns is protected by mu. ipcns is owned by the task goroutine.
+	ipcns *IPCNamespace
+
+	// cpu is the fake cpu number returned by getcpu(2). cpu is ignored
+	// entirely if Kernel.useHostCores is true.
+	// cpu is accessed using atomic memory operations.
+	cpu int32
+
+	// This is used to keep track of changes made to a process' priority/niceness.
+	niceness int
+
+	// startTime is the real time at which the task started.
+	// startTime is protected by mu.
+	startTime ktime.Time
+``` 
+
+`Task` objects can be grouped together into a `TaskSet` for running multi-threaded applications within the sandbox. A `TaskSet` includes a `PIDNamespace` containing a map of `Task`s and various mechanisms for managing concurrent execution of those `Task`s. Source: [gvisor/pkg/sentry/kernel/threads.go](https://github.com/google/gvisor/blob/8ad6657a22b0eaaef7d1b4a31553e826a87e9190/pkg/sentry/kernel/threads.go#L57)
+```go
+type TaskSet struct {
+	// mu protects all relationships between tasks and thread groups in the
+	// TaskSet. (mu is approximately equivalent to Linux's tasklist_lock.)
+	mu sync.RWMutex `state:"nosave"`
+
+	// Root is the root PID namespace, in which all tasks in the TaskSet are
+	// visible. The Root pointer is immutable.
+	Root *PIDNamespace
+
+	// sessions is the set of all sessions.
+	sessions sessionList
+
+	// stopCount is the number of active external stops applicable to all tasks
+	// in the TaskSet (calls to TaskSet.BeginExternalStop that have not been
+	// paired with a call to TaskSet.EndExternalStop). stopCount is protected
+	// by mu.
+	//
+	// stopCount is not saved for the same reason as Task.stopCount; it is
+	// always reset to zero after restore.
+	stopCount int32 `state:"nosave"`
+
+	// liveGoroutines is the number of non-exited task goroutines in the
+	// TaskSet.
+	//
+	// liveGoroutines is not saved; it is reset as task goroutines are
+	// restarted by Task.Start.
+	liveGoroutines sync.WaitGroup `state:"nosave"`
+
+	// runningGoroutines is the number of running task goroutines in the
+	// TaskSet.
+	//
+	// runningGoroutines is not saved; its counter value is required to be zero
+	// at time of save (but note that this is not necessarily the same thing as
+	// sync.WaitGroup's zero value).
+	runningGoroutines sync.WaitGroup `state:"nosave"`
+
+	// aioGoroutines is the number of goroutines running async I/O
+	// callbacks.
+	//
+	// aioGoroutines is not saved but is required to be zero at the time of
+	// save.
+	aioGoroutines sync.WaitGroup `state:"nosave"`
+}
+```
 
 ## Security
 
