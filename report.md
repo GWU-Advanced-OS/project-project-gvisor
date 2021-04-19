@@ -144,14 +144,16 @@ In looking at the performance of gVisor, it is important to look at five main be
 4. File system access
 5. Networking 
 
-An important point that must be discussed before comparing the performance of gVisor is which platform is used to handle system calls made to the host. The first is *Kernerl Virtual Mode (KVM)* which allows Linux itself to act as hypervisor by providing a loadable kernel module. The other option is *ptrace* which allows a process to intercept a system call being called.
+An important point that must be discussed before comparing the performance of gVisor is which platform is used to handle system calls made to the host. The first is *Kernel Virtual Mode (KVM)* which allows Linux itself to act as hypervisor by providing a loadable kernel module. The other option is *ptrace* which allows a process to intercept a system call being called.
 It should be noted that ptrace [suffers from the highest structural costs by far](https://gvisor.dev/docs/architecture_guide/performance/).
 
-A [paper written by Ethan G. Young, et al. at the Univeristy of Wisconsin](https://github.com/GWU-Advanced-OS/project-project-gvisor/tree/main/research/performance-res/true-cost-containing-young.pdf) ran experiments running runc against runsc in both ptrace and KVM mode. Their study examined the two systems in the five different benchmarks discussed previously.
+### The True Cost of Contanerization - Ethan G. Young, et al.
+
+A [paper written by Ethan G. Young, et al. at the Univeristy of Wisconsin](/research/performance-res/true-cost-containing-young.pdf) ran experiments running runc against runsc in both ptrace and KVM mode. Their study examined the two systems in the five different benchmarks discussed previously.
 
 #### Container Startup/Tear Down
 
-![Container Startup/Tear Down Results](https://github.com/GWU-Advanced-OS/project-project-gvisor/tree/main/research/performance-res/young-cont-init.png)
+![Container Startup/Tear Down Results](/research/performance-res/young-cont-init.png)
 
 The results suggest that the differences between running gVisor with ptrace versus KVM for container initialization is neglible. In the context of runc however, there is about a 13% decrease in performance between runc and runsc. Although Google claims that gVisor is designed use in machines with many containers, these results suggest that runc still has an edge here.
 
@@ -159,19 +161,19 @@ The results suggest that the differences between running gVisor with ptrace vers
 
 In order to test the system call performace of gVisor, three versions of the same `gettimeofday` syscall was implemented: one invoking just the Sentry, one invoking the host OS, and the third invoking the use of Gofer. It is also important to note that gVisor was tested in both ptrace and KVM mode.
 
-![System Call Throughput Results](https://github.com/GWU-Advanced-OS/project-project-gvisor/tree/main/research/performance-res/young-syscall.png)
+![System Call Throughput Results](/research/performance-res/young-syscall.png)
 
 The implication here is that even in gVisor's best case (running in KVM and only calling Sentry), the performance is still 2.8x slower. It is also clear from the results that calling to Gofer suffers from the worst performance. Compared to runc, Gofer runs between 156x and 175x slower depeding on the platform.
 
 #### Memory Allocation
 
-![Memory Allocation Results](https://github.com/GWU-Advanced-OS/project-project-gvisor/tree/main/research/performance-res/young-malloc.png)
+![Memory Allocation Results](/research/performance-res/young-malloc.png)
 
 The key takeaway from these results is that gVisor achieves just 40% the allocation rate of native systems.
 
 #### File System Access
 
-![File System Access Results](https://github.com/GWU-Advanced-OS/project-project-gvisor/tree/main/research/performance-res/young-file-access.png)
+![File System Access Results](/research/performance-res/young-file-access.png)
 
 As previously discussed, Gofer suffers from the largest performance tradeoff. This is even more evident in the results of using Gofer to access files. Opening and closing files on Gofer's external tmpfs is 216x slower than native compared to just 12x slower for access to Sentry's internal tmpfs.
 
@@ -180,9 +182,28 @@ As previously discussed, Gofer suffers from the largest performance tradeoff. Th
 gVisor uses its own network stack in order to safely and securely handle all networking down. This is one area in particular that [Google claims "is improving quickly"](https://gvisor.dev/docs/architecture_guide/performance/#network).
 To test networking throughput, `wget` was called for file sizes of various sizes.
 
-![Networking Results](https://github.com/GWU-Advanced-OS/project-project-gvisor/tree/main/research/performance-res/young-network.png)
+![Networking Results](/research/performance-res/young-network.png)
 
 The results show that gVisor may handle small downloads well, relative to native performance, but as file sizes increase, gVisor fails to scale well.
+
+### Security-Performance Trade-offs of Kubernetes Container Runtimes - Viktorsson, et al.
+
+Another [study](/research/performance-res/security-performace-tradeoffs-viktorsson.pdf) attempted to measure the performace of gVisor in more real world applications rather. All tests run in this study used the pTrace platform.
+Three different application's total throughput were tested:
+
+1. **TeaStore:**
+
+- TeaStore is a microservice benchmark that emulates a webstore and provides features that include browising, selecting, and ordering tea. The throughput is measured as the average requests per second throughput for eight available API operations.
+
+2. **Redis:**
+- Redis is an in memory data-store featuring data structures such as hashes, lists, sets, and more. The throughput is measure using requests per second of the O(1) GET operation.
+
+3. **Spark:**
+ - Spark is a distributed general purpose computing framework for big data processing. The throughput is measured as the average number of primes found per second when finding all prime numbers in the first million integers.
+
+![Teastore-Redis-Spark Results](/research/performance-res/redis-spark-teastore-experiment.png)
+
+In testing TeaStore and Spark, gVisor has about 40-60% the throughput of runc. For Redis, it suffers dramtically at just 20% the throughput of runc. The poor performace in Redis is likely due to the fact that it is neither CPU nor memory demanding and thus its performance is based solely on the GET request to in-memory data. This suggests that Redis performance is largely based on networking throughput.
 
 ## Subjective Opinions
 - Sam
