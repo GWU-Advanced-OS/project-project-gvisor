@@ -13,10 +13,127 @@ The poor performance of gVisor in memory usage, networking, I/O and more make th
 
  Function as a Service has become more prevelent in recent years and cloud computing has grown - gVisor provides the requisite security principles and depth for the execution of untrusted guest applications from a myriad of clients in cloud computation, and is optimized for the Function as a Service model frequently implemented in modern cloud computing. As a result of these core features of gVisor, it is highly suitable and immensely valuable in cloud computing while the performance tradeoffs of these core features make gVisor a poor fit for just about any other purpose or environment.
 ## Modules (Sentry, Gofer, runsc, platforms)
-
+.
 ## Abstractions (and code examples showing implementation with type defs)
 
 ## Security
+
+### Overview
+To acheive the wanted level of security and separation, gVisor deploys a few different tactics. Firstly, gVisor ensures that the sandboxed application does not give system calls directly to the host. How is this done? The sentry 'processes' all made system calls from the sandboxed application that are redirected over by ptrace or the KVM (more on that later). Once the sentry receives the redirected system call, it may *not* need to actually communicate with the host. *If* it does, however, it will need to switch out of user-mode to kernel-mode to make the necessary call to the host. But do not fear, the layers don't stop there! The sentry has its own implementation of all whitelisted system calls - the sentry only is allowed a subset of all possible system calls. The sentry has its own user-level networking stack implemented for communication with the host. Like mentioned previously, if the sentry does indeed need to make a system call out to the host, it does it through the netstack. If requested, the sentry can also utilize the host's networking stack implementation in passthrough. Lastly, the sentry has its own file system gopher process, aptly named Gofer. The sentry communicates with Gofer via the 9P protocol.   
+
+
+**The following following diagram illustrates a few key concepts:**
+1. The redirection of system calls that are made by the sandboxed application to the sentry
+2. The limited set of system calls that the Sentry actually has access to
+3. The passing off to Gofer via the 9P protocol
+
+![image info](./assets/fig1.png)
+
+
+**A simple illustration of the user-level networking stack:**
+
+![image info](./assets/fig2.png)
+
+
+### Syscalls
+
+Let's now look at the syscall-related layer in the security sandwich. When the contained application makes a system call, it needs to be redirected somehow to the Sentry, but how is this acheived? The application threads are traced by the Sentry's ptrace implementation.
+
+**Example of how ptrace attaches a tracer to thread**
+```go
+// attach attaches to the thread.
+func (t *thread) attach() {
+	if _, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE, syscall.PTRACE_ATTACH, uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
+		panic(fmt.Sprintf("unable to attach: %v", errno))
+	}
+
+	// PTRACE_ATTACH sends SIGSTOP, and wakes the tracee if it was already
+	// stopped from the SIGSTOP queued by CLONE_PTRACE (see inner loop of
+	// newSubprocess), so we always expect to see signal-delivery-stop with
+	// SIGSTOP.
+	if sig := t.wait(stopped); sig != syscall.SIGSTOP {
+		panic(fmt.Sprintf("wait failed: expected SIGSTOP, got %v", sig))
+	}
+
+	// Initialize options.
+	t.init()
+}
+```
+
+**Does the system call need to be intercepted/run in user-level?**
+```go
+// gvisor/pkg/sentry/kernel/ptrace.go
+
+// ptraceSyscallEnter is called immediately before entering a syscall to check
+// if t should enter ptrace syscall-enter-stop.
+func (t *Task) ptraceSyscallEnter() (taskRunState, bool) {
+	if !t.hasTracer() {
+		return nil, false
+	}
+	t.tg.pidns.owner.mu.RLock()
+	defer t.tg.pidns.owner.mu.RUnlock()
+	switch t.ptraceSyscallMode {
+	case ptraceSyscallNone:
+		return nil, false
+	case ptraceSyscallIntercept:
+		t.Debugf("Entering syscall-enter-stop from PTRACE_SYSCALL") // tracking the syscall
+		t.ptraceSyscallStopLocked()
+		return (*runSyscallAfterSyscallEnterStop)(nil), true
+	case ptraceSyscallEmu:
+		t.Debugf("Entering syscall-enter-stop from PTRACE_SYSEMU") // no host system calls for you
+		t.ptraceSyscallStopLocked()
+		return (*runSyscallAfterSysemuStop)(nil), true
+	}
+	panic(fmt.Sprintf("Unknown ptraceSyscallMode: %v", t.ptraceSyscallMode))
+}
+
+// ...
+
+// gvisor/pkg/sentry/kernel/task_syscall.go
+
+func (t *Task) doSyscallEnter(sysno uintptr, args arch.SyscallArguments) taskRunState {
+	if next, ok := t.ptraceSyscallEnter(); ok { // this means that either a) it needs to be run in user-level, or b) it is being traced
+		return next
+	}
+	return t.doSyscallInvoke(sysno, args) // otherwise, execute!
+}
+```
+
+**Example ```pipe``` syscall implemented in Sentry**
+```go
+// pipe2 implements the actual system call with flags.
+func pipe2(t *kernel.Task, addr hostarch.Addr, flags uint) (uintptr, error) {
+	if flags&^(linux.O_NONBLOCK|linux.O_CLOEXEC) != 0 {
+		return 0, syserror.EINVAL
+	}
+	r, w := pipe.NewConnectedPipe(t, pipe.DefaultPipeSize)
+
+	r.SetFlags(linuxToFlags(flags).Settable())
+	defer r.DecRef(t)
+
+	w.SetFlags(linuxToFlags(flags).Settable())
+	defer w.DecRef(t)
+
+	fds, err := t.NewFDs(0, []*fs.File{r, w}, kernel.FDFlags{
+		CloseOnExec: flags&linux.O_CLOEXEC != 0,
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	if _, err := primitive.CopyInt32SliceOut(t, addr, fds); err != nil {
+		for _, fd := range fds {
+			if file, _ := t.FDTable().Remove(t, fd); file != nil {
+				file.DecRef(t)
+			}
+		}
+		return 0, err
+	}
+	return 0, nil
+}
+```
+
+
 
 ## Performance / Optimizations
 

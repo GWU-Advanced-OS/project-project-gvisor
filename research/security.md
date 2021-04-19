@@ -307,31 +307,6 @@ func (t *thread) attach() {
 }
 ```
 
-### test code example showing error being thrown if "application" makes syscall
-```go
-applicationTest(t, true, testutil.SyscallLoop, func(c *vCPU, regs *arch.Registers, pt *pagetables.PageTables) bool {
-	var si arch.SignalInfo
-	if _, err := c.SwitchToUser(ring0.SwitchOpts{
-		Registers:          regs,
-		FloatingPointState: &dummyFPState,
-		PageTables:         pt,
-		FullRestore:        true,
-	}, &si); err == platform.ErrContextInterrupt {
-		return true // Retry.
-	} else if err != nil {
-		t.Errorf("application syscall with full restore failed: %v", err)
-	}
-	return false
-})
-```
-* and relavent snippet from SwitchToUser with the logic case
-```go
-switch vector {
-	case ring0.Syscall, ring0.SyscallInt80:
-		// Fast path: system call executed.
-		return hostarch.NoAccess, nil
-```
-
 ### sentry communicates with host for syscalls via a userspace network stack
 * code that creates new endpoint socket for netstack in entry
 ```go
