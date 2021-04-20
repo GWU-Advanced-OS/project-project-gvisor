@@ -15,6 +15,8 @@ The poor performance of gVisor in memory usage, networking, I/O and more make th
 ## Modules (Sentry, Gofer, runsc, platforms)
 
 ### Gofer
+#### Filesystem isolation boundaries
+
 The Gofer module is responsible for maintaining isolation boundaries for a sandboxed container's filesystem resources. Gofer is a file proxy that runs as a separate process, isolated from the sandbox, mediating access to filesystem resources. A separate gofer instance runs for each running sandbox instance. They communicate with their respective Sentrys using the 9p protocol. The host filesystem is isolated from the sandbox using an overlay file system. This creates a temporary union mount filesystem. Thus all changes made to files are stored within the sandbox but do not affect the host file system.
 
 Diagram of overlayfs:
@@ -36,7 +38,7 @@ type Gofer struct {
                        //after they have been resolved (direct paths, no symlinks)
 }
 ```
-Gofer is responsible for mounting this filesystem and controlling access. As shown above, there are a number of important variables tracked in the Gofer struct to help with this implementation. The runtime spec file referred to by `specFD` (example [here](https://gist.githubusercontent.com/nl5887/9b26ef8dfa5b7c1247bc09bb46175346/raw/config.json)) is used to set up all the mounts for the Gofer process required by the container. To set up its mount namespace, Gofer first turns all shared mounts into slave mounts so that changes can propagate into the shared mounts but not outside of the namespace into the host. This mount command uses the `MS_SLAVE` and `MS_REC` to accomplish this so that every mount under "/" becomes a slave. Next, the root needs to be mounted on a new `tmpfs` (temporary filesystem). `runsc` requires a `/proc` directory so the `tmpfs` is mounted here. Under `/proc`, new directories `/proc/proc` and `/proc/root` are created to give a location for the new sandboxed root. The new `/proc/proc` is mounted with the following flags for to prevent any attempts to break out of the isolated sandbox:
+Gofer is responsible for mounting this filesystem and controlling access. As shown above, there are a number of important variables tracked in the Gofer struct to help with this implementation. The runtime spec file referred to by `specFD` (example [here](https://gist.githubusercontent.com/nl5887/9b26ef8dfa5b7c1247bc09bb46175346/raw/config.json)) is used to set up all the mounts for the Gofer process required by the container. To set up its mount namespace, Gofer first turns all shared mounts into slave mounts so that changes can propagate into the shared mounts but not outside of the namespace into the host. This mount command uses the `MS_SLAVE` and `MS_REC` to accomplish this so that every mount under "/" becomes a slave. Next, the root needs to be mounted on a new `tmpfs` (temporary filesystem). `runsc` requires a `/proc` directory so the new `tmpfs` is mounted here. Under `/proc`, new directories `/proc/proc` and `/proc/root` are created to give a location for the new sandboxed root. The new `/proc/proc` is mounted with the following flags for to prevent any attempts to break out of the isolated sandbox:
 - MS_RDONLY
     - don't allow process to write changes.
 - MS_NOSUID
@@ -54,9 +56,38 @@ The container's source directory specified by the spec file is then mounted on t
 - MS_REC
     - Recursively propagate these mount options to all subdirectories of the mount point.
 
+```
+// pivot_root(".", ".") makes a mount of the working directory the new
+// root filesystem, so it will be moved in "/" and then the old_root
+// will be moved to "/" too. The parent mount of the old_root will be
+// new_root, so after umounting the old_root, we will see only
+// the new_root in "/".
+if err := unix.PivotRoot(".", "."); err != nil {
+    return fmt.Errorf("pivot_root failed, make sure that the root mount has a parent: %v", err)
+}
+if err := unix.Unmount(".", unix.MNT_DETACH); err != nil {
+    return fmt.Errorf("error umounting the old root file system: %v", err)
+}
+```
+After setting up the root of the filesystem, the rest of any subsequent mounts necessary for the container's execution are mounted in the correct location under the new root. At this point, this filesystem is still in a subdirectory of `/proc` so the next step is to use `pivotRoot()` to change the root of the Gofer process's filesystem namespace to the one just created and to unmount everything outside the fs it just set up. Lastly, Gofer uses `chroot` to further isolate the processes root one more subdirectory to `/root` (because `/proc/root` just turned into `/root` in the process's namespace). Now the process sees `/` as it's own image, containing all code needed to execute, completely isolated from the host OS.
 
+#### Process limitations
+After setting up the filesystem, Gofer uses two methods of limiting what the process can do. It limits Capabilities and system calls. First it applies the minimal set of capabilities required to operate on files:
+```
+var caps = []string{
+	"CAP_CHOWN",
+	"CAP_DAC_OVERRIDE",
+	"CAP_DAC_READ_SEARCH",
+	"CAP_FOWNER",
+	"CAP_FSETID",
+	"CAP_SYS_CHROOT",
+}
+```
+Next it uses seccomp and BPF filters to limit the system calls available to the process. Similarly to the applied capabilities, Gofer whitelists only the system calls required for execution, thus limiting the attack surface for the process.
 
-
+#### Server Model
+...
+...
 
 
 
@@ -66,7 +97,8 @@ The container's source directory specified by the spec file is then mounted on t
 
 
 ### Platforms
-The platform module of gVisor is essentially the Virtual Machine Monitor for the system. The platform handles context switches and the mapping of memory as well as the intercepting of system calls from guest applications running in a virtual machine. gVisor offers two implementations of the platform model - ptrace and KVM. While both platform implementations support the same functionalities there are distinct differences and clear tradeoffs between them. The ptrace implementation offers higher portability as it can run anywhere ptrace works while KVM only functions on bare hardware or in VMs with nested virtualization enabled. The lesser constraints on deployment of ptrace provides more widespread compatability for gVisor, but at a cost. The ptrace implementation has a far higher overhead for context switches than KVM and therefore ill-suited for deployment on systems with a high rate of system call-heavy guest applications. (gVisor Platform Guide)
+The platform module of gVisor is essentially the Virtual Machine Monitor for the system. The platform handles context switches and the mapping of memory as well as the intercepting of system calls from guest applications running in a virtual machine. gVisor offers two implementations of the platform model - ptrace and KVM. While both platform implementations support the same functionalities there are distinct differences and clear tradeoffs between them. The ptrace implementation offers higher portability as it can run anywhere ptrace works while KVM only functions on bare hardware or in VMs with nested virtualization enabled. The lesser constraints on deployment of ptrace provides more widespread compatability for gVisor, but at a cost. The ptrace implementation has a far higher overhead for context switches than KVM and therefore ill-suited for deployment on systems with a high rate of system call-heavy guest applications. 
+Source: [gVisor platform guide](https://gvisor.dev/docs/architecture_guide/platforms/)
 
  This difference in context switch overhead is a result of the distinct ways in which the platform implementations handle the interception and forwarding of system calls.
 
@@ -77,6 +109,8 @@ The platform module of gVisor is essentially the Virtual Machine Monitor for the
         switch errno {
         case 0: // Expected case.
 ```
+Source: [/gvisor/pkg/sentry/platform/kvm/bluepill_unsafe.go](https://github.com/google/gvisor/blob/master/pkg/sentry/platform/kvm/bluepill_unsafe.go)
+
 In contrast to KVM forwarding system calls to the Sentry in Ring0 through the invokation of bluepill functions, the ptrace implementation instead handles system call forwarding by making the same system call received from the guest application with PTRACE enabled in order to prevent the host kernel from actually servicing the request as Ptrace in the host kernel forwards the system call to the Sentry.
 ```
 func (t *thread) syscall(regs *arch.Registers) (uintptr, error) {
@@ -93,6 +127,8 @@ func (t *thread) syscall(regs *arch.Registers) (uintptr, error) {
 			panic(fmt.Sprintf("ptrace syscall-enter failed: %v", errno))
 		}
 ```
+Source: [/gvisor/pkg/sentry/platform/ptrace/subprocess.go](https://github.com/google/gvisor/blob/master/pkg/sentry/platform/ptrace/subprocess.go)
+
 While this maintains the same isolation and principles of defense in depth of the KVM implementation, this implementation of system call handling results in a definitively larger overhead for ptrace mode. However, this extra redirection and utilization of Ptrace in the host kernel for redirection is precisely what gives the Ptrace platform its superior compatability properties compared to KVM. Since KVM directly forwards system calls to the Sentry it cannot run in a virtual machine with nested virtualization disabled. Ptrace, however, can run inside of a VM with virtualization disabled as the system calls will simply be made to the VM hypervisor in Ptrace mode where they will then be redirected to the Sentry - this implementation eliminates the need for a hypervisor (such as KVM) executing within a hypervisor.
 
  In addition to handling context switches and system call forwarding, the platform is responsible for memory mappings between both guest applications and the Sentry as well as the initialization of memory reserved to and managed by the Sentry. When a Sentry is built and the guest physical memory for said Sentrys sandbox is allocated the platform makes the ```mmap()``` system call to the host kernel to fill the host address space with ```PROT_NONE``` mappings to set up the guest physical memory of the Sentry.
@@ -113,6 +149,8 @@ unix.PROT_NONE,
 unix.MAP_ANONYMOUS|unix.MAP_PRIVATE|unix.MAP_NORESERVE,
 0, 0)
 ```
+Source: [/gvisor/pkg/sentry/platform/kvm/physical_map.go](https://github.com/google/gvisor/blob/master/pkg/sentry/platform/kvm/physical_map.go)
+
 When a new sandbox is created the platform creates a new page table and computes mappings from the sandboxes guest virtual addresses to Sentrys guest physical regions. Throughout execution the platform performs translations between applications guest virtual addresses and the Sentrys guest physical addresses.
 ```
 // PhysicalFor returns the physical address for a set of PTEs.
@@ -125,11 +163,15 @@ func (a *allocator) PhysicalFor(ptes *pagetables.PTEs) uintptr {
 ```
 func (a *allocator) LookupPTEs(physical uintptr) *pagetables.PTEs {
 ```
+Source: [/gvisor/pkg/sentry/platform/kvm/physical_map.go](https://github.com/google/gvisor/blob/master/pkg/sentry/platform/kvm/physical_map.go)
+
 While both KVM and Ptrace serve alongside the Sentry as the virtual machine monitor, their representations of the guest applications they manage differs. The difference in how each platform implementation represent and track data for guest applications is likely due to the added requirements of Ptrace in order to properly trace the execution and state of said guest application.
 
 In the KVM implementation, guest applications are simply represented as a ```context``` which consists of an address space, register set, a ```machine``` and a few other bookkeeping data items. The ```machine``` data structure is where KVM maintains data on a particular VM. A switch simply consists of enabling interrupts on the virtual CPU of the machine, setting the address space as active, and loading register states.
 
-While the Ptrace implementation of context switches also maintains similar data to KVM in a ```context``` data structure, the tracing of guest applications necessitates a subprocess to trace threads. Host threads are created depending on the number of active guest applications within a sandbox. A subprocess is a collection of traced threads, consisting of a pool of threads reserved for emulation, one reserved for system calls. The need to trace the execution of threads necessitates these subprocesses and complicates context switches in this platform. In order to switch to a given context the current runtime thread must be locked, then Ptrace must find the traced subprocess for this runtime thread and then perform the operation in this traced subprocess.
+While the Ptrace implementation of context switches also maintains similar data to KVM in a ```context``` data structure, the tracing of guest applications necessitates a subprocess to trace threads. Host threads are created depending on the number of active guest applications within a sandbox. A subprocess is a collection of traced threads, consisting of a pool of threads reserved for emulation, one reserved for system calls. The need to trace the execution of threads necessitates these subprocesses and complicates context switches in this platform. In order to switch to a given context the current runtime thread must be locked, then Ptrace must find the traced subprocess for this runtime thread and then perform the operation in this traced subprocess. 
+
+Source: [/gvisor/pkg/sentry/platform/ptrace/ptrace.go](https://github.com/google/gvisor/blob/master/pkg/sentry/platform/ptrace/ptrace.go)
 
 While the Ptrace implementation of the platform offers more general compatability than KVM, the necessities of tracing thread execution complicate the operations supported by the platform. In addition to the added complexity of having traced subprocesses backing guest threads, the way in which Ptrace handles system call redirection to the Sentry results in higher overhead than KVM, having the effect of decreasing the practical applications of Ptrace-mode gVisor.
 
@@ -143,7 +185,7 @@ Because gVisor runs its own kernel via the Sentry, a gVisor sandbox appears as a
 ```go
 type Task struct {
 	taskNode
-	
+
     //task goroutine's ID
     goid int64 `state:"nosave"`
 
@@ -190,7 +232,7 @@ type Task struct {
 	// startTime is the real time at which the task started.
 	// startTime is protected by mu.
 	startTime ktime.Time
-``` 
+```
 
 `Task` objects can be grouped together into a `TaskSet` for running multi-threaded applications within the sandbox. A `TaskSet` includes a `PIDNamespace` containing a map of `Task`s and various mechanisms for managing concurrent execution of those `Task`s. Source: [gvisor/pkg/sentry/kernel/threads.go](https://github.com/google/gvisor/blob/8ad6657a22b0eaaef7d1b4a31553e826a87e9190/pkg/sentry/kernel/threads.go#L57)
 ```go
@@ -383,11 +425,10 @@ func pipe2(t *kernel.Task, addr hostarch.Addr, flags uint) (uintptr, error) {
 }
 ```
 
-
-
 ## Performance / Optimizations
 
 In looking at the performance of gVisor, it is important to look at five main benchmarks:
+
 1. Container startup/tear down
 2. System call throughput
 3. Memory allocation
@@ -455,18 +496,149 @@ Three different application's total throughput were tested:
 
 In testing TeaStore and Spark, gVisor has about 40-60% the throughput of runc. For Redis, it suffers dramtically at just 20% the throughput of runc. The poor performace in Redis is likely due to the fact that it is neither CPU nor memory demanding and thus its performance is based solely on the GET request to in-memory data. This suggests that Redis performance is largely based on networking throughput.
 
+### A Deeper Look into Memory Allocation in gVisor
+
+gVisor's memory allocation system involves a two-level physical to virtual mapping where first Sentry requests memory chunks of 16MB increments from the host OS. Then, when an application running in the sandbox requests memory (using `mmap()`), Sentry allocates a portion of the 16MB chunk for the application.
+
+#### From Host to Sentry
+
+First we'll look at the sequence of code that allows Sentry to get memory from the host OS. `Allocate()` returns a `MemoryFile` which is a mapping of a chunk of memory from the host. This is the struct that Sentry will later use to find available pages of memory to allocate to an application.
+
+```go
+// Line 381 of pgalloc.go
+// Allocate returns a range of initially-zeroed pages of the given length with
+// the given accounting kind and a single reference held by the caller. When
+// the last reference on an allocated page is released, ownership of the page
+// is returned to the MemoryFile, allowing it to be returned by a future call
+// to Allocate.
+//
+// Preconditions: length must be page-aligned and non-zero.
+func (f *MemoryFile) Allocate(length uint64, kind usage.MemoryKind) (memmap.FileRange, error) {
+
+    // ...
+
+    // Align hugepage-and-larger allocations on hugepage boundaries to try
+    // to take advantage of hugetmpfs.
+    alignment := uint64(hostarch.PageSize)
+    if length >= hostarch.HugePageSize {
+        alignment = hostarch.HugePageSize
+    }
+
+    // Find a range in the underlying file.
+    fr, ok := findAvailableRange(&f.usage, f.fileSize, length, alignment)
+    if !ok {
+        return memmap.FileRange{}, syserror.ENOMEM
+    }
+
+    // ...
+
+    if f.opts.ManualZeroing {
+        if err := f.manuallyZero(fr); err != nil {
+            return memmap.FileRange{}, err
+        }
+    }
+    // Mark selected pages as in use.
+    if !f.usage.Add(fr, usageInfo{
+        kind: kind,
+        refs: 1,
+    }) {
+        panic(fmt.Sprintf("allocating %v: failed to insert into usage set:\n%v", fr, &f.usage))
+    }
+
+    return fr, nil
+}
+```
+
+#### From Sentry to Application
+
+When an application running in gVisor calls `mmap()`, first the `Mmap()` syscall is invoked:
+
+``` go
+// Line 42 of sys_mmap.go
+func Mmap(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error)
+```
+It is important to note the two arguments to the function: `t *kernel.Task` and `args arch.SyscallArguments`. 
+A `Task` represents an execution thread in an un-trusted app. This includes thread-specific state such as registers.
+`SyscallArguments` include the length of the memory region requested and a pointer to the memory. These arguments will later be stored in an `MMapOpts` object inside `MMap()`.
+
+From here, `MMap()` is invoked in Sentry.
+
+``` go
+// Line 75 of syscalls.go
+func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostarch.Addr, error) {
+```
+This function takes in `Context`, which represents the thread of execution, as well as the `MMapOpts` that was created in the previous function.
+
+Inside of `MMap()`, `createVMALocked` is called on line 122 which is where a new VMA is allocated.
+
+``` go
+// Line 33 of vma.go
+func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOpts) (vmaIterator, hostarch.AddrRange, error) {
+
+    // ...
+    // Line 38
+
+    // Find a usable range.
+    addr, err := mm.findAvailableLocked(opts.Length, findAvailableOpts{
+        Addr:     opts.Addr,
+        Fixed:    opts.Fixed,
+        Unmap:    opts.Unmap,
+        Map32Bit: opts.Map32Bit,
+    })
+
+    // ...
+    // Line 55    
+
+    // Check against RLIMIT_AS.
+    newUsageAS := mm.usageAS + opts.Length
+    if opts.Unmap {
+        newUsageAS -= uint64(mm.vmas.SpanRange(ar))
+    }
+    if limitAS := limits.FromContext(ctx).Get(limits.AS).Cur; newUsageAS > limitAS {
+        return vmaIterator{}, hostarch.AddrRange{}, syserror.ENOMEM
+    }
+
+    if opts.MLockMode != memmap.MLockNone {
+        // Check against RLIMIT_MEMLOCK.
+        if creds := auth.CredentialsFromContext(ctx); !creds.HasCapabilityIn(linux.CAP_IPC_LOCK, creds.UserNamespace.Root()) {
+            mlockLimit := limits.FromContext(ctx).Get(limits.MemoryLocked).Cur
+            if mlockLimit == 0 {
+                return vmaIterator{}, hostarch.AddrRange{}, syserror.EPERM
+            }
+            newLockedAS := mm.lockedAS + opts.Length
+            if opts.Unmap {
+                newLockedAS -= mm.mlockedBytesRangeLocked(ar)
+            }
+            if newLockedAS > mlockLimit {
+                return vmaIterator{}, hostarch.AddrRange{}, syserror.EAGAIN
+            }
+        }
+    }
+
+    // ...
+}
+```
+
+`createVMALocked()` finds a mappable region of memory to allocate. One of the important check is to see if the `Context` has access to this region and can allocate more memory.
+
+#### Tradeoffs of gVisor's Memory Allocation
+Due to the double level page table system, applications requesting small pieces of memory (relative to the size requested from the host by Sentry) suffer in performace. As the size of the memory requested by an application increases, the performance increases. However, it should be noted that memory allocation of any size is not very fast in gvisor relative native Linux containers.
+
 ### Blending Containers and Virtual Machines: A Study of Firecracker and gVisor - Anjali, et al.
 
 This next [paper](research/performance-res/blending-containers-vms-anjali.pdf) studied memory performance differences between native Linux with no isolation, Linux containers, and gVisor (using KVM-mode).
 
-Because of gVisors two level page tables, Sentry requests memory from the host in 16MB chunks in order to reduce the number of `mmap()` calls to the host. When 1GB of memory is requested by the host application, there will be exactly 64 `mmap()` calls to the host. 
+Because of gVisors two level page tables, Sentry requests memory from the host in 16MB chunks in order to reduce the number of `mmap()` calls to the host. When 1GB of memory is requested by the host application, there will be exactly 64 `mmap()` calls to the host.
 
 ![gVisor Memory Allocation](research/performance-res/mem-alloc-time.png)
 
-The test performed called `mmap()` with varying sizes ranging from 4KB to 1MB for a total of 1GB of memory. The results show that when allocating 4KB pieces gVisor performs about 16x slower than host Linux and Linux containers. When allocating 64KB chunks, the gap lessens by almost half and gVisor is only 8-10x slower. 
+The test performed called `mmap()` with varying sizes ranging from 4KB to 1MB for a total of 1GB of memory. The results show that when allocating 4KB pieces gVisor performs about 16x slower than host Linux and Linux containers. When allocating 64KB chunks, the gap lessens by almost half and gVisor is only 8-10x slower.
 In the case of comparing to gVisor, the difference between host Linux and Linux containers is negligble.
 This is an important implication as there is a trend between gVisor's memory allocation performace and the size of the request: as size increases, gVisor's gap to Linux grows smaller. This is likely due to the two-level page table system implemented in gVisor. As an application's memory request grows closer to 16MB, less work in Sentry is being performed to further split that chunk into smaller pieces for the applications running in the sandbox.
 
+### Performace Conclusion
+
+From the studies presented, it is clear that if performance is a concern, gVisor is not a good fit for applications requiring heacy use of syscalls, heavy uses of memory, heavy uses of networking, nor heavy uses of file system accesses. gVisor instead is a good fit for lightweight, serveless applications. Because gVisor does not suffer a significant performance loss in building, deploying, and destroying containers compared to standard Linux containers, secure containers can be quickly created for lightweight applications as needed.
 
 ## Subjective Opinions
 - Sam
