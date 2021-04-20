@@ -97,7 +97,8 @@ Next it uses seccomp and BPF filters to limit the system calls available to the 
 
 
 ### Platforms
-The platform module of gVisor is essentially the Virtual Machine Monitor for the system. The platform handles context switches and the mapping of memory as well as the intercepting of system calls from guest applications running in a virtual machine. gVisor offers two implementations of the platform model - ptrace and KVM. While both platform implementations support the same functionalities there are distinct differences and clear tradeoffs between them. The ptrace implementation offers higher portability as it can run anywhere ptrace works while KVM only functions on bare hardware or in VMs with nested virtualization enabled. The lesser constraints on deployment of ptrace provides more widespread compatability for gVisor, but at a cost. The ptrace implementation has a far higher overhead for context switches than KVM and therefore ill-suited for deployment on systems with a high rate of system call-heavy guest applications. (gVisor Platform Guide)
+The platform module of gVisor is essentially the Virtual Machine Monitor for the system. The platform handles context switches and the mapping of memory as well as the intercepting of system calls from guest applications running in a virtual machine. gVisor offers two implementations of the platform model - ptrace and KVM. While both platform implementations support the same functionalities there are distinct differences and clear tradeoffs between them. The ptrace implementation offers higher portability as it can run anywhere ptrace works while KVM only functions on bare hardware or in VMs with nested virtualization enabled. The lesser constraints on deployment of ptrace provides more widespread compatability for gVisor, but at a cost. The ptrace implementation has a far higher overhead for context switches than KVM and therefore ill-suited for deployment on systems with a high rate of system call-heavy guest applications. 
+Source: [gVisor platform guide](https://gvisor.dev/docs/architecture_guide/platforms/)
 
  This difference in context switch overhead is a result of the distinct ways in which the platform implementations handle the interception and forwarding of system calls.
 
@@ -108,6 +109,8 @@ The platform module of gVisor is essentially the Virtual Machine Monitor for the
         switch errno {
         case 0: // Expected case.
 ```
+Source: [/gvisor/pkg/sentry/platform/kvm/bluepill_unsafe.go](https://github.com/google/gvisor/blob/master/pkg/sentry/platform/kvm/bluepill_unsafe.go)
+
 In contrast to KVM forwarding system calls to the Sentry in Ring0 through the invokation of bluepill functions, the ptrace implementation instead handles system call forwarding by making the same system call received from the guest application with PTRACE enabled in order to prevent the host kernel from actually servicing the request as Ptrace in the host kernel forwards the system call to the Sentry.
 ```
 func (t *thread) syscall(regs *arch.Registers) (uintptr, error) {
@@ -124,6 +127,8 @@ func (t *thread) syscall(regs *arch.Registers) (uintptr, error) {
 			panic(fmt.Sprintf("ptrace syscall-enter failed: %v", errno))
 		}
 ```
+Source: [/gvisor/pkg/sentry/platform/ptrace/subprocess.go](https://github.com/google/gvisor/blob/master/pkg/sentry/platform/ptrace/subprocess.go)
+
 While this maintains the same isolation and principles of defense in depth of the KVM implementation, this implementation of system call handling results in a definitively larger overhead for ptrace mode. However, this extra redirection and utilization of Ptrace in the host kernel for redirection is precisely what gives the Ptrace platform its superior compatability properties compared to KVM. Since KVM directly forwards system calls to the Sentry it cannot run in a virtual machine with nested virtualization disabled. Ptrace, however, can run inside of a VM with virtualization disabled as the system calls will simply be made to the VM hypervisor in Ptrace mode where they will then be redirected to the Sentry - this implementation eliminates the need for a hypervisor (such as KVM) executing within a hypervisor.
 
  In addition to handling context switches and system call forwarding, the platform is responsible for memory mappings between both guest applications and the Sentry as well as the initialization of memory reserved to and managed by the Sentry. When a Sentry is built and the guest physical memory for said Sentrys sandbox is allocated the platform makes the ```mmap()``` system call to the host kernel to fill the host address space with ```PROT_NONE``` mappings to set up the guest physical memory of the Sentry.
@@ -144,6 +149,8 @@ unix.PROT_NONE,
 unix.MAP_ANONYMOUS|unix.MAP_PRIVATE|unix.MAP_NORESERVE,
 0, 0)
 ```
+Source: [/gvisor/pkg/sentry/platform/kvm/physical_map.go](https://github.com/google/gvisor/blob/master/pkg/sentry/platform/kvm/physical_map.go)
+
 When a new sandbox is created the platform creates a new page table and computes mappings from the sandboxes guest virtual addresses to Sentrys guest physical regions. Throughout execution the platform performs translations between applications guest virtual addresses and the Sentrys guest physical addresses.
 ```
 // PhysicalFor returns the physical address for a set of PTEs.
@@ -156,11 +163,15 @@ func (a *allocator) PhysicalFor(ptes *pagetables.PTEs) uintptr {
 ```
 func (a *allocator) LookupPTEs(physical uintptr) *pagetables.PTEs {
 ```
+Source: [/gvisor/pkg/sentry/platform/kvm/physical_map.go](https://github.com/google/gvisor/blob/master/pkg/sentry/platform/kvm/physical_map.go)
+
 While both KVM and Ptrace serve alongside the Sentry as the virtual machine monitor, their representations of the guest applications they manage differs. The difference in how each platform implementation represent and track data for guest applications is likely due to the added requirements of Ptrace in order to properly trace the execution and state of said guest application.
 
 In the KVM implementation, guest applications are simply represented as a ```context``` which consists of an address space, register set, a ```machine``` and a few other bookkeeping data items. The ```machine``` data structure is where KVM maintains data on a particular VM. A switch simply consists of enabling interrupts on the virtual CPU of the machine, setting the address space as active, and loading register states.
 
-While the Ptrace implementation of context switches also maintains similar data to KVM in a ```context``` data structure, the tracing of guest applications necessitates a subprocess to trace threads. Host threads are created depending on the number of active guest applications within a sandbox. A subprocess is a collection of traced threads, consisting of a pool of threads reserved for emulation, one reserved for system calls. The need to trace the execution of threads necessitates these subprocesses and complicates context switches in this platform. In order to switch to a given context the current runtime thread must be locked, then Ptrace must find the traced subprocess for this runtime thread and then perform the operation in this traced subprocess.
+While the Ptrace implementation of context switches also maintains similar data to KVM in a ```context``` data structure, the tracing of guest applications necessitates a subprocess to trace threads. Host threads are created depending on the number of active guest applications within a sandbox. A subprocess is a collection of traced threads, consisting of a pool of threads reserved for emulation, one reserved for system calls. The need to trace the execution of threads necessitates these subprocesses and complicates context switches in this platform. In order to switch to a given context the current runtime thread must be locked, then Ptrace must find the traced subprocess for this runtime thread and then perform the operation in this traced subprocess. 
+
+Source: [/gvisor/pkg/sentry/platform/ptrace/ptrace.go](https://github.com/google/gvisor/blob/master/pkg/sentry/platform/ptrace/ptrace.go)
 
 While the Ptrace implementation of the platform offers more general compatability than KVM, the necessities of tracing thread execution complicate the operations supported by the platform. In addition to the added complexity of having traced subprocesses backing guest threads, the way in which Ptrace handles system call redirection to the Sentry results in higher overhead than KVM, having the effect of decreasing the practical applications of Ptrace-mode gVisor.
 
