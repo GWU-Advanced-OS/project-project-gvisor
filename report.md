@@ -590,6 +590,25 @@ The results show that gVisor may handle small downloads well, relative to native
 #### Threading model
 [Goroutines](https://tour.golang.org/concurrency/1) are lightweight threads managed by the Go runtime. Within gVisor's [resource model documentation](https://gvisor.dev/docs/architecture_guide/resources/), it is explained that gvisor uses lightweight "green threads". This is used for individual Sentry tasks and the Gofer server model. See this [paper](https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.8.9238&rep=rep1&type=pdf) comparing Linux Threads to Green Threads. This paper explains green threads in the Java runtime but the concept applies here as well for the Go runtime. Green threads are a userspace thread implementation that don't need a backing kernel thread. In this model, green threads are mapped to a single task and can be managed with little overhead. This is in contrast to the system calls required with linux threads. Thread activation also takes less overhead because Linux threads must create a corresponding execution entity within the kernel. When latency is important for an application, it is recommended for threads to be created at initialization rather than on demand. This explains the use of goroutines rather than native Linux threads throughout gVisor.
 
+#### Gofer Server Synchronization
+The below code `Lock()` function is the function used (as discussed above in the Gofer module) line 519 of gvisor/pkg/p9/server.go.
+```
+// If the lock is already in use, the calling goroutine
+// blocks until the mutex is available.
+func (m *Mutex) Lock() {
+	// Fast path: grab unlocked mutex.
+	if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
+		if race.Enabled {
+			race.Acquire(unsafe.Pointer(m))
+		}
+		return
+	}
+	// Slow path (outlined so that the fast path can be inlined)
+	m.lockSlow()
+}
+```
+You can see an interesting optimization here where the fast path assumes the mutex is free and inlines that logic in the function. If the mutex is taken, `lockSlow()` is implemented in a different function because the blocking mechanism takes more logic and is therefore slow pathed.
+
 
 ### Security-Performance Trade-offs of Kubernetes Container Runtimes - Viktorsson, et al.
 
