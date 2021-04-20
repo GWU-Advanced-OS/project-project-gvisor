@@ -311,28 +311,26 @@ All memory within a gVisor sandbox is managed by the Sentry using demand-paging 
 ## Security
 
 ### Overview
-To acheive the wanted level of security and separation, gVisor deploys a few different tactics. Firstly, gVisor ensures that the sandboxed application does not give system calls directly to the host. How is this done? The sentry 'processes' all made system calls from the sandboxed application that are redirected over by ptrace or the KVM (more on that later). Once the sentry receives the redirected system call, it may *not* need to actually communicate with the host. *If* it does, however, it will need to switch out of user-mode to kernel-mode to make the necessary call to the host. But do not fear, the layers don't stop there! The sentry has its own implementation of all whitelisted system calls - the sentry only is allowed a subset of all possible system calls. The sentry has its own user-level networking stack implemented for communication with the host. Like mentioned previously, if the sentry does indeed need to make a system call out to the host, it does it through the netstack. If requested, the sentry can also utilize the host's networking stack implementation in passthrough. Lastly, the sentry has its own file system gopher process, aptly named Gofer. The sentry communicates with Gofer via the 9P protocol.   
+To acheive the wanted level of security and separation, gVisor deploys a few different tactics.
 
-
-**The following following diagram illustrates a few key concepts:**
+**The following following diagram illustrates a few key concepts for the security methodology:**
 1. The redirection of system calls that are made by the sandboxed application to the sentry
 2. The limited set of system calls that the Sentry actually has access to
 3. The passing off to Gofer via the 9P protocol
 
-![image info](./assets/fig1.png)
-
-
-**A simple illustration of the user-level networking stack:**
-
-![image info](./assets/fig2.png)
-
+![image info](./research/security-res/fig1.png)
 
 ### Syscalls
+Firstly, gVisor ensures that the sandboxed application does not give system calls directly to the host. How is this done? Threads from the application are tracked, or traced, rather, by the Sentry's ptrace implementation. ptrace attaches a tracer to each necessary application thread, as well as all of the init options for the thread. So, when the application makes a system call, ptrace knows and can control its state. The baton is then handed off to the Sentry to actually process the system call request. If the call can be done completely in user-level with the implemented syscalls in the Sentry, it will do so in order to have unnecessary switches out of user-level. If there needs to be a call out to the host, then the Sentry can do so via the user-level netstack (more on that later). Lastly, if the system call is not allowed by the Sentry, then it will *not* be performed, but the application will have *no* knowledge of this capability block. 
 
-Let's now look at the syscall-related layer in the security sandwich. When the contained application makes a system call, it needs to be redirected somehow to the Sentry, but how is this acheived? The application threads are traced by the Sentry's ptrace implementation.
+Lets take a look at some examples.
 
-**Example of how ptrace attaches a tracer to thread**
+This function attaches a ptrace to a particular thread for tracing. Additionally, options for the ptrace are initialized. 
+
 ```go
+
+// gvisor/pkg/sentry/platform/ptrace/subprocess.go, LINE 282
+
 // attach attaches to the thread.
 func (t *thread) attach() {
 	if _, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE, syscall.PTRACE_ATTACH, uintptr(t.tid), 0, 0, 0, 0); errno != 0 {
@@ -351,8 +349,10 @@ func (t *thread) attach() {
 	t.init()
 }
 ```
+**Code Ex. 1**
 
-**Does the system call need to be intercepted/run in user-level?**
+This code excerpt shows the logic for checking a syscall for whether it is being tracked, needs to be run in user-level, or can be invoked.
+
 ```go
 // gvisor/pkg/sentry/kernel/ptrace.go
 
@@ -390,8 +390,12 @@ func (t *Task) doSyscallEnter(sysno uintptr, args arch.SyscallArguments) taskRun
 	return t.doSyscallInvoke(sysno, args) // otherwise, execute!
 }
 ```
+**Code Ex. 2**
 
-**Example ```pipe``` syscall implemented in Sentry**
+The sentry has its own implementation of all whitelisted system calls - the sentry only is allowed a subset of all possible system calls. 51 to be exact, which can all be found in the gvisor/pkg/sentry/syscalls/linux directory. This reduced set of system calls allows for a smaller attack surface. The fewer system calls there are, the fewer possibilities there are for an attacker to pass malicious arguments or perform other exploits. This is also assisted by the many layers that are present from when the contained application makes the call, to when the call is invoked, if ever. All of this seems expensive though, doesn't it? Well it is. gVisor even acknowledges in its documentation that if your contained application needs to make many system calls, there will be a significant performance hit. This is due to the necessity of tracing the system calls and applications for security - without that, the security model just crumbles.
+
+And here is an example of a 'whitelisted' system call in the Sentry. It is an individual implementation of linux's pipe(2) system call.
+
 ```go
 // pipe2 implements the actual system call with flags.
 func pipe2(t *kernel.Task, addr hostarch.Addr, flags uint) (uintptr, error) {
@@ -424,6 +428,14 @@ func pipe2(t *kernel.Task, addr hostarch.Addr, flags uint) (uintptr, error) {
 	return 0, nil
 }
 ```
+**Code Ex. 3**
+
+### User-level Netstack
+
+![image info](./research/security-res/fig2.png)
+**Fig. 2**
+
+### Gopher
 
 ## Performance / Optimizations
 
@@ -645,5 +657,6 @@ From the studies presented, it is clear that if performance is a concern, gVisor
 - Jake
 - Jack
 - Will
+gVisor is a very secure container implementation with many layers of defense in depth, and it shows (preventing security vulnerabilities that docker, for example, was subsceptible to). However, there is a consequential and significant performance hit. I don't necessarily think this is a nail in the coffin, though. To acheive the level of security that gVisor was intending to reach, there are necessary tradeoffs that had to be made - like tracing all system calls and redirecting to be intercepted. That simply cannot be cheap no matter which way you look at it. But that is not the point of gVisor. The core component is security, and it does it very well. 
 - Jon
 The performance hits gVisor takes as an effect of the features of its security oriented design seem so significant that gVisor would be entirely useless in any setting other than a serverless framework operating on the principle of functions as a service. This is exactly what it was designed for, so this isn’t a huge insult, but it certainly is not a very versatile system and modifying it to be of use in other environments does not seem like a feasible task to undertake. The security principles of the system are exceptional and it is clear how gVisor would be far better for fully isolating applications from each other than traditional container sandboxing. For its intended purpose gVisor provides much needed security and isolation, and the performance tradeoffs with security are worth it. When used in the type of systems it was intended for, the improved construction and deconstruction time of containers should have a larger impact on performance than the issues with performance gVisor faces at runtime - in all, gVisor adequately meets its goals and successfully tackles the problems it tries to solve with container sandboxing with acceptable tradeoffs, making it a very good system for serverless framework cloud computing.
