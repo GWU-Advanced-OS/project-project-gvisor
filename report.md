@@ -382,19 +382,26 @@ All memory within a gVisor sandbox is managed by the Sentry using demand-paging 
 ## Security
 
 ### Overview
-To acheive the wanted level of security and separation, gVisor deploys a few different tactics.
 
-**The following following diagram illustrates a few key concepts for the security methodology:**
-1. The redirection of system calls that are made by the sandboxed application to the sentry
-2. The limited set of system calls that the Sentry actually has access to
-3. The passing off to Gofer via the 9P protocol
+gVisor’s purpose is to provide a secure container for processes that are assumed to be untrusted – if you did not write it, it is untrusted! Or, at least, that is the philosophy for gVisor. Security in depth allows for the ability to run processes in gVisor without the worry of malicious system call use, troublesome file I/O (thank you, Gofer), and even Linux security vulnerabilities that affect other containers (see: https://gvisor.dev/blog/2020/09/18/containing-a-real-vulnerability/).
+
+How does gVisor accomplish this level of depth in security? It employs the following mechanisms:
+1.	Re-routing and intercepting system calls from the untrusted process.
+2.	Individual implementations of Linux system calls in the Sentry.
+3.	Reduced set of whitelisted system calls allowed for the Sentry.
+4.	Communication between the Sentry and the host via a user-level networking stack.
+5.	File operations provided by Gofer over the 9P protocol.
 
 ![image info](./research/security-res/fig1.png)
+**Security Fig. 1**
 
-### Syscalls
-Firstly, gVisor ensures that the sandboxed application does not give system calls directly to the host. How is this done? Threads from the application are tracked, or traced, rather, by the Sentry's ptrace implementation. ptrace attaches a tracer to each necessary application thread, as well as all of the init options for the thread. So, when the application makes a system call, ptrace knows and can control its state. The baton is then handed off to the Sentry to actually process the system call request. If the call can be done completely in user-level with the implemented syscalls in the Sentry, it will do so in order to have unnecessary switches out of user-level. If there needs to be a call out to the host, then the Sentry can do so via the user-level netstack (more on that later). Lastly, if the system call is not allowed by the Sentry, then it will *not* be performed, but the application will have *no* knowledge of this capability block.
+### Re-routing and intercepting system calls from the untrusted process.
 
-Lets take a look at some examples.
+gVisor ensures that the sandboxed application does not give system calls directly to the host. Threads from the application are tracked, or traced rather, by the Sentry's ptrace implementation. ptrace attaches a tracer to each necessary application thread, as well as all the init() options for the thread's tracking. So, when the application makes a system call, ptrace can redirect over to the Sentry to process the system call, whether that be executing in user level, not allowing the system call at all, or making a call out to the host. In addition to ptrace, the KVM’s ring0 platform ensures that system calls from the application are caught in guest mode and handled accordingly by the supplied system call handler and sent over to the Sentry. See platforms for a more detailed overview of KVM.
+
+The security baton is then handed off to the Sentry to process the system call request. If the call can be done completely in user-level with the implemented system calls in the Sentry, it will do so in order to have unnecessary switches out of user-level. If there needs to be a call out to the host, then the Sentry can do so via the user-level networking stack, the Netstack (more on that later). Lastly, if the system call is not allowed by the Sentry, then it will *not* be performed, but the application will have *no* knowledge of this capability block.
+
+Let us look at some examples.
 
 This function attaches a ptrace to a particular thread for tracing. Additionally, options for the ptrace are initialized.
 
@@ -422,7 +429,7 @@ func (t *thread) attach() {
 ```
 **Code Ex. 1**
 
-This code excerpt shows the logic for checking a syscall for whether it is being tracked, needs to be run in user-level, or can be invoked.
+This code excerpt shows the logic for checking a system call for whether it is being tracked, needs to be run in user-level, or can be invoked.
 
 ```go
 // gvisor/pkg/sentry/kernel/ptrace.go
@@ -463,7 +470,7 @@ func (t *Task) doSyscallEnter(sysno uintptr, args arch.SyscallArguments) taskRun
 ```
 **Code Ex. 2**
 
-Like mentioned previously, if the thread does not have the proper privilege to perform a capability, then it will not allow the action, but it will still look like there is an implementation for the syscall to the callee.
+Like mentioned previously, if the thread does not have the proper privilege to perform a capability, then it will not allow the action, but it will still look like there is an implementation for the system call to the callee.
 
 ```go
 // CapError gives a syscall function that checks for capability c.  If the task
@@ -490,9 +497,11 @@ func CapError(name string, c linux.Capability, note string, urls []string) kerne
 ```
 **Code Ex. 3**
 
-The sentry has its own implementation of all whitelisted system calls - the sentry only is allowed a subset of all possible system calls. 51 to be exact, which can all be found in the gvisor/pkg/sentry/syscalls/linux directory. This reduced set of system calls allows for a smaller attack surface. The fewer system calls there are, the fewer possibilities there are for an attacker to pass malicious arguments or perform other exploits. This is also assisted by the many layers that are present from when the contained application makes the call, to when the call is invoked, if ever. All of this seems expensive though, doesn't it? Well it is. gVisor even acknowledges in its documentation that if your contained application needs to make many system calls, there will be a significant performance hit. This is due to the necessity of tracing the system calls and applications for security - without that, the security model just crumbles.
+### Individual implementations and whitelisting of system calls
 
-And here is an example of a 'whitelisted' system call in the Sentry. It is an individual implementation of linux's pipe(2) system call.
+The sentry has its own implementation of all whitelisted system calls - the sentry only is allowed a subset of all possible system calls. 51 to be exact, which can all be found in the “gvisor/pkg/sentry/syscalls/linux” directory. This reduced set of system calls allows for a smaller attack surface. The fewer system calls there are, the fewer possibilities there are for an attacker to pass malicious arguments or perform other exploits. This is also assisted by the many layers that are present from when the contained application makes the call, to when the call is invoked, if ever. All of this seems expensive though, doesn't it? Well, it is. gVisor even acknowledges in its documentation that if your contained application needs to make many system calls, there will be a significant performance hit. This is due to the necessity of tracing the system calls and applications for security - without that, the security model is significantly reduced. In KVM mode in contrast with ptrace, there is less overhead but more compatibility issues, so as with most other things, performance is not free.
+
+And here is an example of a whitelisted system call in the Sentry. It is an individual implementation of Linux's pipe(2) system call.
 
 ```go
 // pipe2 implements the actual system call with flags.
@@ -528,13 +537,14 @@ func pipe2(t *kernel.Task, addr hostarch.Addr, flags uint) (uintptr, error) {
 ```
 **Code Ex. 4**
 
-### User-level Netstack
+### Netstack communication between the Sentry and the host
+
+The use of a virtualized networking device in the Sentry to communicate with the host if a system call is needed adds to the levels of defense that gVisor is attempting to provide. In addition, the user space networking stack allows for gVisor to implement networking capabilities with the reduced set of system calls. This is done with use of only three additional system calls. If, however, more performance is required for networking, the contained application may use passthrough mode, which allows for use of the host’s network stack implementation. Why not always use this? More performance is better, right? There is a tradeoff! Surprise, surprise, the increased performance of passthrough necessitates more whitelisted system calls, including increased file I/O like creating file descriptors, greatly increasing the attack surface of gVisor. So, the general trend continues for less performance = more security.
+
 
 ![image info](./research/security-res/fig2.png)
 
-**Fig. 2**
-
-### Gopher
+**Security Fig. 2**
 
 ## Performance / Optimizations
 
