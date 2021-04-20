@@ -392,6 +392,33 @@ func (t *Task) doSyscallEnter(sysno uintptr, args arch.SyscallArguments) taskRun
 ```
 **Code Ex. 2**
 
+Like mentioned previously, if the thread does not have the proper privilege to perform a capability, then it will not allow the action, but it will still look like there is an implementation for the syscall to the callee.
+
+```go
+// CapError gives a syscall function that checks for capability c.  If the task
+// has the capability, it returns ENOSYS, otherwise EPERM. To unprivileged
+// tasks, it will seem like there is an implementation.
+func CapError(name string, c linux.Capability, note string, urls []string) kernel.Syscall {
+	if note != "" {
+		note = note + "; "
+	}
+	return kernel.Syscall{
+		Name: name,
+		Fn: func(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+			if !t.HasCapability(c) {
+				return 0, nil, syserror.EPERM
+			}
+			t.Kernel().EmitUnimplementedEvent(t)
+			return 0, nil, syserror.ENOSYS
+		},
+		SupportLevel: kernel.SupportUnimplemented,
+		Note:         fmt.Sprintf("%sReturns %q if the process does not have %s; %q otherwise.", note, syserror.EPERM, c.String(), syserror.ENOSYS),
+		URLs:         urls,
+	}
+}
+```
+**Code Ex. 3**
+
 The sentry has its own implementation of all whitelisted system calls - the sentry only is allowed a subset of all possible system calls. 51 to be exact, which can all be found in the gvisor/pkg/sentry/syscalls/linux directory. This reduced set of system calls allows for a smaller attack surface. The fewer system calls there are, the fewer possibilities there are for an attacker to pass malicious arguments or perform other exploits. This is also assisted by the many layers that are present from when the contained application makes the call, to when the call is invoked, if ever. All of this seems expensive though, doesn't it? Well it is. gVisor even acknowledges in its documentation that if your contained application needs to make many system calls, there will be a significant performance hit. This is due to the necessity of tracing the system calls and applications for security - without that, the security model just crumbles.
 
 And here is an example of a 'whitelisted' system call in the Sentry. It is an individual implementation of linux's pipe(2) system call.
@@ -428,11 +455,12 @@ func pipe2(t *kernel.Task, addr hostarch.Addr, flags uint) (uintptr, error) {
 	return 0, nil
 }
 ```
-**Code Ex. 3**
+**Code Ex. 4**
 
 ### User-level Netstack
 
 ![image info](./research/security-res/fig2.png)
+
 **Fig. 2**
 
 ### Gopher
