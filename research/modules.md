@@ -50,7 +50,7 @@ type Gofer struct {
 }
 ```
 The main logic of this program begins with `Execute()`. It begins by populating two variables, `conf`, and `spec`. `conf` is an instance of a [config](https://pkg.go.dev/gvisor.dev/gvisor/runsc/config#Config) which holds environment configuration information that isn't a part of the runtime spec. The runtime spec (example [here](https://gist.githubusercontent.com/nl5887/9b26ef8dfa5b7c1247bc09bb46175346/raw/config.json)) is populated into `spec` by calling `specutils.ReadSpecFromFile()` on the file obtained with the `specFD` field of the `Gofer` struct. This method parses through the json spec file and updates the `conf` variable and then returns `spec`. This is important as these will be used throughout the rest of the program.
-... maybe above gets too specific...moving on for now...
+
 Setting up the root filesystem:
 `func setupRootFS(spec *specs.Spec, conf *config.Config) error {`
 This function first turns all shared mounts into slave mounts so that changes can propagate into the shared mounts but not outside of the namespace into the host. This mount command uses the `MS_SLAVE` and `MS_REC` to accomplish this so that every mount under "/" becomes a slave. Next, the root needs to be mounted on a new `tmpfs` filesystem. `runsc` requires a `/proc` directory so the `tmpfs` is mounted here. Under `/proc`, new directories `/proc/proc` and `/proc/root` are created to give a location for the sandbox root. The new `/proc/proc` is mounted with the following flags for to prevent any attempts to break out of the isolated sandbox:
@@ -213,7 +213,61 @@ cs.recvMu.Unlock()
 ```
 ... the goroutine spawns another goroutine (on the same connection state `cs`) to handle the next request from the client as it finishes handling the current one and sending a response. That if statement checks to see if another goroutine is already waiting to take the mutex above, and if so, doesn't need to spawn a new one because as soon as this one unlocks and releases the mutex, that one will come into the critical section to handle the next response. Assuming the goroutines can quickly process and send responses to the clients, this thread pool will never grow too large and will simply reuse the same small set of goroutines per connection.
 
+To actually handle the request and perform some filesystem operation, `cs.handle()` is called with the received message. The action depends on the message, so the message handler function implements the handler interface shown below to carry out the appropriate action. Some different options are also shown below.
 
+![handler interface](handler_interface.png)
+
+An example, Tread, which is used for read requests:
+```
+// line 683 in /gvisor/pkg/p9/handlers.go
+// handle implements handler.handle.
+func (t *Tread) handle(cs *connState) message {
+	ref, ok := cs.LookupFID(t.FID)
+	if !ok {
+		return newErr(unix.EBADF)
+	}
+	defer ref.DecRef()
+
+	// Constrain the size of the read buffer.
+	if int(t.Count) > int(maximumLength) {
+		return newErr(unix.ENOBUFS)
+	}
+
+	var (
+		data = make([]byte, t.Count)
+		n    int
+	)
+	if err := ref.safelyRead(func() (err error) {
+		// Has it been opened already?
+		if !ref.opened {
+			return unix.EINVAL
+		}
+
+		// Can it be read? Check permissions.
+		if ref.openFlags&OpenFlagsModeMask == WriteOnly {
+			return unix.EPERM
+		}
+
+		n, err = ref.file.ReadAt(data, t.Offset)
+		return err
+	}); err != nil && err != io.EOF {
+		return newErr(err)
+	}
+
+	return &Rread{Data: data[:n]}
+}
+```
+This method returns the data requested from the filesystem. A write request would return the number of bytes successfully written. Whatever message is returned from the respective `handle()` implementation is then sent back to the client:
+```
+//line 571 in gvisor/pkg/p9/server.go
+// Handle the message.
+r := cs.handle(m)
+...
+// Send back the result.
+cs.sendMu.Lock()
+err = send(cs.conn, tag, r)
+cs.sendMu.Unlock()
+```
 
 
 ## Jon Terry

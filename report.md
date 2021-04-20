@@ -23,9 +23,10 @@ Diagram of overlayfs:
 
 ![overlayfs_diagram](research/overlay_constructs.jpg)
 
-The above image shows three layers. The bottom layer is the root directory of the application to be run and sandboxed by gVisor. This is called the `lowerdir` and represents the directory on the host OS. The container is mounted on `upperdir` and `merged`. `merged` is a slave mount, meaning that changes in the `lowerdir` will propagate towards `merged` but not the other way around. `merged` appears to be a full image/filesystem to the container. This is possible because any changes or additions to the filesystem are stored in `upperdir` so it still appears to have full access and control of its filesystem. This is useful because the container can make any changes and use the image at will without having to copy the entire directory into a new sandboxed filesystem.
+The above image shows three layers. The bottom layer is the root directory of the application to be run and sandboxed by gVisor. This is called the `lowerdir` and represents the directory on the host OS. The container is mounted on `upperdir` and `merged`. `merged` is a slave mount, meaning that changes in the `lowerdir` will propagate towards `merged` but not the other way around. `merged` appears to be a full image/filesystem to the container. This is possible because any changes or additions to the filesystem are stored in `upperdir` so it still appears to have full access and control of its filesystem. This is useful because the container can make any changes and use the image at will without having to copy the entire directory into a new sandboxed filesystem (See this [paper](https://www.usenix.org/system/files/hotstorage19-paper-koller.pdf) discussing overlay filesystems).
 
 ```
+// line 39 in gvisor/runsc/cmd/gofer.go
 type Gofer struct {
 	bundleDir string   //refers to the directory containing the executable code
 	ioFDs     intFlags //file descriptors used to communicate with 9p servers
@@ -57,6 +58,7 @@ The container's source directory specified by the spec file is then mounted on t
     - Recursively propagate these mount options to all subdirectories of the mount point.
 
 ```
+// line 39 in gvisor/runsc/cmd/chroot.go
 // pivot_root(".", ".") makes a mount of the working directory the new
 // root filesystem, so it will be moved in "/" and then the old_root
 // will be moved to "/" too. The parent mount of the old_root will be
@@ -74,6 +76,7 @@ After setting up the root of the filesystem, the rest of any subsequent mounts n
 #### Process limitations
 After setting up the filesystem, Gofer uses two methods of limiting what the process can do. It limits Capabilities and system calls. First it applies the minimal set of capabilities required to operate on files:
 ```
+// line 39 in gvisor/runsc/cmd/gofer.go
 var caps = []string{
 	"CAP_CHOWN",
 	"CAP_DAC_OVERRIDE",
@@ -86,13 +89,80 @@ var caps = []string{
 Next it uses seccomp and BPF filters to limit the system calls available to the process. Similarly to the applied capabilities, Gofer whitelists only the system calls required for execution, thus limiting the attack surface for the process.
 
 #### Server Model
+Gofer acts as the file server for the running gVisor containers. This means each container is a client that must request request Gofer to perform any necessary filesystem operations. After sandboxing the Gofer process, a list of p9 attachers is allocated. Then, beginning with `/`, an attach point is created for every mount point specified in the spec file. As well as holding the mount points necessary for the container, the OCI specfile holds a list of `ioFD`s which are file descriptors used to connect to 9P servers. Iterating through the list of associated `ioFD`s and attachment points, a goroutine is started to create a new socket for each `ioFD` and a new p9 server for each attachment point. This logic is shown below.
+```
+// line 218 in gvisor/runsc/cmd/gofer.go
+func runServers(ats []p9.Attacher, ioFDs []int) {
+	// Run the loops and wait for all to exit.
+	var wg sync.WaitGroup
+	for i, ioFD := range ioFDs {
+		wg.Add(1)
+		go func(ioFD int, at p9.Attacher) {
+			socket, err := unet.NewSocket(ioFD)
+			if err != nil {
+				Fatalf("creating server on FD %d: %v", ioFD, err)
+			}
+			s := p9.NewServer(at)
+			if err := s.Handle(socket); err != nil {
+				Fatalf("P9 server returned error. Gofer is shutting down. FD: %d, err: %v", ioFD, err)
+			}
+			wg.Done()
+		}(ioFD, ats[i])
+	}
+	wg.Wait()
+	log.Infof("All 9P servers exited.")
+}
+```
+As shown above, to begin, the gofer creates one goroutine per client connection and calls `Handle()`. `Handle()` creates a connection state for the given connection and calls `handleRequests()`. This method is a simple wrapper that just infinitely calls `handleRequest()` until an error is thrown or the goroutine receives the shutdown signal (i.e. another goroutine detected a connection problem). `handleRequest()` "handles" the main logic of dealing with client connections. The first step is to receive the client request.
+```
+// Line 121 - ReadVec() in gvisor/pkg/unet/unet_unsafe.go
+for {
+    var e unix.Errno
+    // Try a non-blocking recv first, so we don't give up the go runtime M.
+    n, _, e = unix.RawSyscall(unix.SYS_RECVMSG, uintptr(fd), uintptr(unsafe.Pointer(&msg)), unix.MSG_DONTWAIT|unix.MSG_TRUNC)
+    if e == 0 {
+        break
+    }
+    ... error handling ...
+    // Wait for the socket to become readable.
+    err := r.socket.wait(false)
+    ... error handling ...
+}
+```
+Gofer will attempt to use a non-blocking receive first, and will only block if there is no data incoming. This allows the runtime to be given up when the client isn't currently requesting anything. When there is more traffic on the stream however, the non-blocking receive will handle client requests immediately. This all takes place within a critical section which is entered by taking the receive mutex on the client connection struct, as shown below:
+```
+// line 518 in gvisor/pkg/p9/server.go
+atomic.AddInt32(&cs.recvIdle, 1)
+cs.recvMu.Lock()
+atomic.AddInt32(&cs.recvIdle, -1)
+```
+Before actually handling the message just received, Gofer will make sure another goroutine is ready to handle the next incomming request:
+```
+// line 545 in gvisor/pkg/p9/server.go
+// Ensure that another goroutine is available to receive from cs.conn.
+if atomic.LoadInt32(&cs.recvIdle) == 0 {
+    go cs.handleRequests() // S/R-SAFE: Irrelevant.
+}
+cs.recvMu.Unlock()
+```
+If `recvIdle` is zero, that means that no goroutines on the given client state (`cs`) are waiting for the mutex. So Gofer spawns another goroutine on the same `cs` to recieve the next message while it handles the current one. If there is one waiting for the mutex, it will be able to receive the next message as soon as the current one releases the mutex. Assuming the goroutines can quickly process and send responses to the clients, this thread pool will never grow too large and will simply reuse the same small set of goroutines per connection.
+
+Handling the request and performing an operation.
+```
+//line 571 in gvisor/pkg/p9/server.go
+// Handle the message.
+r := cs.handle(m)
 ...
-...
+// Send back the result.
+cs.sendMu.Lock()
+err = send(cs.conn, tag, r)
+cs.sendMu.Unlock()
+```
+To actually handle the request and perform some filesystem operation, `cs.handle()` is called with the received message. The action depends on the message, so the message handler function implements the handler interface shown below to carry out the appropriate action. Some different options are also shown below.
 
+![handler interface](research/handler_interface.png)
 
-
-
-
+For example, a `Tread` request carries out a read request and returns the data requested. A `Twrite` request will carry out a write and return the number of bytes successfully written. Whatever is returned in `r` is then sent back to the client to complete this interaction.
 
 
 
