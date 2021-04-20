@@ -239,6 +239,33 @@ type TaskSet struct {
 }
 ```
 
+### Files
+Files in the sandbox can be backed by multiple implementations. For host-native files (where a file descriptor is available), the Gofer may return a file descriptor to the Sentry via [SCM_RIGHTS](http://man7.org/linux/man-pages/man7/unix.7.html). Interactions with file descriptors use the same system calls as Linux, but the calls are implemeted in the Sentry and Gofer. Files can also be mapped into an application's address space in the sandbox using gVisor's `Mappable` interface, similar to `mmap` on Linux. Multiple sandboxes can use shared memory by mapping the same file. In addition to interacting with files on the host system, gVisor creates filesystems that exist only within the sandbox, such as a `tmpfs` at `/tmp` or `/dev/shm`. These filesystems count against the sandbox's memory allowance from the host.
+
+gVisor filesystems are implemented similarly to Linux as well. A filesystem in gVisor consists of a tree of reference-counted `Dentry` nodes. Each `Dentry` node maintains a reference to a `DentryImpl`, or Dentry implementation. The `DentryImpl` defines how a specific `Dentry` should be managed. Unlike Linux, `Dentry` nodes in gVisor are not associated with inodes. This is due to communication with Gofer occuring through a 9P api rather than raw block devices. In addition, virtual filesystems within a sandbox would lose track of files from the host if the host were to rename an inode. Because `Dentry` nodes are handled this way, filesystems in gVisor are not responsible for deleting `Dentry` nodes with a reference count of 0. `Dentry` reference counts instead reperesent the extent to which a filesystem requires a certain `Dentry` node. The filesystem can continue to cache `Dentry` nodes with no references, or they may be discarded. The `Dentry` interface definintion can be seen below. Source: [pkg/sentry/vfs/dentry.go](https://github.com/google/gvisor/blob/20b1c3c632277bd64eac4d0442bda9695f184fc9/pkg/sentry/vfs/dentry.go#L61)
+```go
+type Dentry struct {
+	// mu synchronizes deletion/invalidation and mounting over this Dentry.
+	mu sync.Mutex `state:"nosave"`
+
+	// dead is true if the file represented by this Dentry has been deleted (by
+	// CommitDeleteDentry or CommitRenameReplaceDentry) or invalidated (by
+	// InvalidateDentry). dead is protected by mu.
+	dead bool
+
+	// mounts is the number of Mounts for which this Dentry is Mount.point.
+	// mounts is accessed using atomic memory operations.
+	mounts uint32
+
+	// impl is the DentryImpl associated with this Dentry. impl is immutable.
+	// This should be the last field in Dentry.
+	impl DentryImpl
+}
+```
+
+### Memory
+All memory within a gVisor sandbox is managed by the Sentry using demand-paging and backed by a single `memfs`. Address space creation is platform specific, and for some platforms, the Sentry may create addtional helper processes on the host to support additional address spaces. Like the sandbox itself, the helper processes are subject to various usage limits. Physical memory is all controlled by the host. The Sentry populates mappings from the host and allows the host to control demand-paging. The Sentry will not demand an individual page of memory. Instead, it uses memory-allocation heuristics to select regions. Generally, the Sentry can't tell whether a page is active and only provides approximate usage statistics. It can gather more accurate information if required, but only with an expensive API call. Pages are swapped and reclaimed by the host without the Sentry knowing. Providing that information to the Sentry would open the sandbox too much. The exception to this rule is when an application frees memory. The Sentry immediately releases that memory back to the host, allowing the host to most effectively manage multiplexed resources and its own memory allocation policies. There is potential for this to slow performance in the sandbox; if the Sentry needs that memory again, it must make another request to the host. Lastly, the Sentry also maintains an internal cache for storing files needed in the sandbox that can't be referenced with a host file descriptor.
+
 ## Security
 
 ### Overview
