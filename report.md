@@ -546,6 +546,10 @@ The use of a virtualized networking device in the Sentry to communicate with the
 
 **Security Fig. 2**
 
+### Gofer
+
+Another layer of the security model is the separation between the Sentry and file operations. The Sentry is able to have Gofer service its requests for file operations via 9P. In the interest of not adding more length to this novella, I will link [here for more Gofer explanation.](https://github.com/GWU-Advanced-OS/project-project-gvisor/blob/main/report.md#gofer)
+
 ## Performance / Optimizations
 
 In looking at the performance of gVisor, it is important to look at five main benchmarks:
