@@ -160,6 +160,7 @@ cs.sendMu.Unlock()
 ```
 To actually handle the request and perform some filesystem operation, `cs.handle()` is called with the received message. The action depends on the message, so the message handler function implements the handler interface shown below to carry out the appropriate action. Some different options are also shown below.
 
+line 68 in gvisor/pkg/p9/handlers.go
 ![handler interface](research/handler_interface.png)
 
 For example, a `Tread` request carries out a read request and returns the data requested. A `Twrite` request will carry out a write and return the number of bytes successfully written. Whatever is returned in `r` is then sent back to the client to complete this interaction.
@@ -593,6 +594,7 @@ The results show that gVisor may handle small downloads well, relative to native
 #### Gofer Server Synchronization
 The below code `Lock()` function is the function used (as discussed above in the Gofer module) line 519 of gvisor/pkg/p9/server.go.
 ```
+// line 72 /usr/local/go/src/sync/mutex.go
 // If the lock is already in use, the calling goroutine
 // blocks until the mutex is available.
 func (m *Mutex) Lock() {
@@ -607,7 +609,7 @@ func (m *Mutex) Lock() {
 	m.lockSlow()
 }
 ```
-You can see an interesting optimization here where the fast path assumes the mutex is free and inlines that logic in the function. If the mutex is taken, `lockSlow()` is implemented in a different function because the blocking mechanism takes more logic and is therefore slow pathed.
+You can see an interesting Go optimization here where the fast path assumes the mutex is free and inlines that logic in the function. If the mutex is taken, `lockSlow()` is implemented in a different function because the blocking mechanism takes more logic and is therefore slow pathed.
 
 
 ### Security-Performance Trade-offs of Kubernetes Container Runtimes - Viktorsson, et al.
