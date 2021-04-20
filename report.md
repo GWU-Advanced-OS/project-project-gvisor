@@ -15,6 +15,8 @@ The poor performance of gVisor in memory usage, networking, I/O and more make th
 ## Modules (Sentry, Gofer, runsc, platforms)
 
 ### Gofer
+#### Filesystem isolation boundaries
+
 The Gofer module is responsible for maintaining isolation boundaries for a sandboxed container's filesystem resources. Gofer is a file proxy that runs as a separate process, isolated from the sandbox, mediating access to filesystem resources. A separate gofer instance runs for each running sandbox instance. They communicate with their respective Sentrys using the 9p protocol. The host filesystem is isolated from the sandbox using an overlay file system. This creates a temporary union mount filesystem. Thus all changes made to files are stored within the sandbox but do not affect the host file system.
 
 Diagram of overlayfs:
@@ -36,7 +38,7 @@ type Gofer struct {
                        //after they have been resolved (direct paths, no symlinks)
 }
 ```
-Gofer is responsible for mounting this filesystem and controlling access. As shown above, there are a number of important variables tracked in the Gofer struct to help with this implementation. The runtime spec file referred to by `specFD` (example [here](https://gist.githubusercontent.com/nl5887/9b26ef8dfa5b7c1247bc09bb46175346/raw/config.json)) is used to set up all the mounts for the Gofer process required by the container. To set up its mount namespace, Gofer first turns all shared mounts into slave mounts so that changes can propagate into the shared mounts but not outside of the namespace into the host. This mount command uses the `MS_SLAVE` and `MS_REC` to accomplish this so that every mount under "/" becomes a slave. Next, the root needs to be mounted on a new `tmpfs` (temporary filesystem). `runsc` requires a `/proc` directory so the `tmpfs` is mounted here. Under `/proc`, new directories `/proc/proc` and `/proc/root` are created to give a location for the new sandboxed root. The new `/proc/proc` is mounted with the following flags for to prevent any attempts to break out of the isolated sandbox:
+Gofer is responsible for mounting this filesystem and controlling access. As shown above, there are a number of important variables tracked in the Gofer struct to help with this implementation. The runtime spec file referred to by `specFD` (example [here](https://gist.githubusercontent.com/nl5887/9b26ef8dfa5b7c1247bc09bb46175346/raw/config.json)) is used to set up all the mounts for the Gofer process required by the container. To set up its mount namespace, Gofer first turns all shared mounts into slave mounts so that changes can propagate into the shared mounts but not outside of the namespace into the host. This mount command uses the `MS_SLAVE` and `MS_REC` to accomplish this so that every mount under "/" becomes a slave. Next, the root needs to be mounted on a new `tmpfs` (temporary filesystem). `runsc` requires a `/proc` directory so the new `tmpfs` is mounted here. Under `/proc`, new directories `/proc/proc` and `/proc/root` are created to give a location for the new sandboxed root. The new `/proc/proc` is mounted with the following flags for to prevent any attempts to break out of the isolated sandbox:
 - MS_RDONLY
     - don't allow process to write changes.
 - MS_NOSUID
@@ -54,9 +56,38 @@ The container's source directory specified by the spec file is then mounted on t
 - MS_REC
     - Recursively propagate these mount options to all subdirectories of the mount point.
 
+```
+// pivot_root(".", ".") makes a mount of the working directory the new
+// root filesystem, so it will be moved in "/" and then the old_root
+// will be moved to "/" too. The parent mount of the old_root will be
+// new_root, so after umounting the old_root, we will see only
+// the new_root in "/".
+if err := unix.PivotRoot(".", "."); err != nil {
+    return fmt.Errorf("pivot_root failed, make sure that the root mount has a parent: %v", err)
+}
+if err := unix.Unmount(".", unix.MNT_DETACH); err != nil {
+    return fmt.Errorf("error umounting the old root file system: %v", err)
+}
+```
+After setting up the root of the filesystem, the rest of any subsequent mounts necessary for the container's execution are mounted in the correct location under the new root. At this point, this filesystem is still in a subdirectory of `/proc` so the next step is to use `pivotRoot()` to change the root of the Gofer process's filesystem namespace to the one just created and to unmount everything outside the fs it just set up. Lastly, Gofer uses `chroot` to further isolate the processes root one more subdirectory to `/root` (because `/proc/root` just turned into `/root` in the process's namespace). Now the process sees `/` as it's own image, containing all code needed to execute, completely isolated from the host OS.
 
+#### Process limitations
+After setting up the filesystem, Gofer uses two methods of limiting what the process can do. It limits Capabilities and system calls. First it applies the minimal set of capabilities required to operate on files:
+```
+var caps = []string{
+	"CAP_CHOWN",
+	"CAP_DAC_OVERRIDE",
+	"CAP_DAC_READ_SEARCH",
+	"CAP_FOWNER",
+	"CAP_FSETID",
+	"CAP_SYS_CHROOT",
+}
+```
+Next it uses seccomp and BPF filters to limit the system calls available to the process. Similarly to the applied capabilities, Gofer whitelists only the system calls required for execution, thus limiting the attack surface for the process.
 
-
+#### Server Model
+...
+...
 
 
 
@@ -328,11 +359,11 @@ In testing TeaStore and Spark, gVisor has about 40-60% the throughput of runc. F
 
 This next [paper](research/performance-res/blending-containers-vms-anjali.pdf) studied memory performance differences between native Linux with no isolation, Linux containers, and gVisor (using KVM-mode).
 
-Because of gVisors two level page tables, Sentry requests memory from the host in 16MB chunks in order to reduce the number of `mmap()` calls to the host. When 1GB of memory is requested by the host application, there will be exactly 64 `mmap()` calls to the host. 
+Because of gVisors two level page tables, Sentry requests memory from the host in 16MB chunks in order to reduce the number of `mmap()` calls to the host. When 1GB of memory is requested by the host application, there will be exactly 64 `mmap()` calls to the host.
 
 ![gVisor Memory Allocation](research/performance-res/mem-alloc-time.png)
 
-The test performed called `mmap()` with varying sizes ranging from 4KB to 1MB for a total of 1GB of memory. The results show that when allocating 4KB pieces gVisor performs about 16x slower than host Linux and Linux containers. When allocating 64KB chunks, the gap lessens by almost half and gVisor is only 8-10x slower. 
+The test performed called `mmap()` with varying sizes ranging from 4KB to 1MB for a total of 1GB of memory. The results show that when allocating 4KB pieces gVisor performs about 16x slower than host Linux and Linux containers. When allocating 64KB chunks, the gap lessens by almost half and gVisor is only 8-10x slower.
 In the case of comparing to gVisor, the difference between host Linux and Linux containers is negligble.
 This is an important implication as there is a trend between gVisor's memory allocation performace and the size of the request: as size increases, gVisor's gap to Linux grows smaller. This is likely due to the two-level page table system implemented in gVisor. As an application's memory request grows closer to 16MB, less work in Sentry is being performed to further split that chunk into smaller pieces for the applications running in the sandbox.
 
