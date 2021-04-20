@@ -143,7 +143,7 @@ Because gVisor runs its own kernel via the Sentry, a gVisor sandbox appears as a
 ```go
 type Task struct {
 	taskNode
-	
+
     //task goroutine's ID
     goid int64 `state:"nosave"`
 
@@ -190,7 +190,7 @@ type Task struct {
 	// startTime is the real time at which the task started.
 	// startTime is protected by mu.
 	startTime ktime.Time
-``` 
+```
 
 `Task` objects can be grouped together into a `TaskSet` for running multi-threaded applications within the sandbox. A `TaskSet` includes a `PIDNamespace` containing a map of `Task`s and various mechanisms for managing concurrent execution of those `Task`s. Source: [gvisor/pkg/sentry/kernel/threads.go](https://github.com/google/gvisor/blob/8ad6657a22b0eaaef7d1b4a31553e826a87e9190/pkg/sentry/kernel/threads.go#L57)
 ```go
@@ -356,11 +356,10 @@ func pipe2(t *kernel.Task, addr hostarch.Addr, flags uint) (uintptr, error) {
 }
 ```
 
-
-
 ## Performance / Optimizations
 
 In looking at the performance of gVisor, it is important to look at five main benchmarks:
+
 1. Container startup/tear down
 2. System call throughput
 3. Memory allocation
@@ -428,18 +427,149 @@ Three different application's total throughput were tested:
 
 In testing TeaStore and Spark, gVisor has about 40-60% the throughput of runc. For Redis, it suffers dramtically at just 20% the throughput of runc. The poor performace in Redis is likely due to the fact that it is neither CPU nor memory demanding and thus its performance is based solely on the GET request to in-memory data. This suggests that Redis performance is largely based on networking throughput.
 
+### A Deeper Look into Memory Allocation in gVisor
+
+gVisor's memory allocation system involves a two-level physical to virtual mapping where first Sentry requests memory chunks of 16MB increments from the host OS. Then, when an application running in the sandbox requests memory (using `mmap()`), Sentry allocates a portion of the 16MB chunk for the application.
+
+#### From Host to Sentry
+
+First we'll look at the sequence of code that allows Sentry to get memory from the host OS. `Allocate()` returns a `MemoryFile` which is a mapping of a chunk of memory from the host. This is the struct that Sentry will later use to find available pages of memory to allocate to an application.
+
+```go
+// Line 381 of pgalloc.go
+// Allocate returns a range of initially-zeroed pages of the given length with
+// the given accounting kind and a single reference held by the caller. When
+// the last reference on an allocated page is released, ownership of the page
+// is returned to the MemoryFile, allowing it to be returned by a future call
+// to Allocate.
+//
+// Preconditions: length must be page-aligned and non-zero.
+func (f *MemoryFile) Allocate(length uint64, kind usage.MemoryKind) (memmap.FileRange, error) {
+
+    // ...
+
+    // Align hugepage-and-larger allocations on hugepage boundaries to try
+    // to take advantage of hugetmpfs.
+    alignment := uint64(hostarch.PageSize)
+    if length >= hostarch.HugePageSize {
+        alignment = hostarch.HugePageSize
+    }
+
+    // Find a range in the underlying file.
+    fr, ok := findAvailableRange(&f.usage, f.fileSize, length, alignment)
+    if !ok {
+        return memmap.FileRange{}, syserror.ENOMEM
+    }
+
+    // ...
+
+    if f.opts.ManualZeroing {
+        if err := f.manuallyZero(fr); err != nil {
+            return memmap.FileRange{}, err
+        }
+    }
+    // Mark selected pages as in use.
+    if !f.usage.Add(fr, usageInfo{
+        kind: kind,
+        refs: 1,
+    }) {
+        panic(fmt.Sprintf("allocating %v: failed to insert into usage set:\n%v", fr, &f.usage))
+    }
+
+    return fr, nil
+}
+```
+
+#### From Sentry to Application
+
+When an application running in gVisor calls `mmap()`, first the `Mmap()` syscall is invoked:
+
+``` go
+// Line 42 of sys_mmap.go
+func Mmap(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error)
+```
+It is important to note the two arguments to the function: `t *kernel.Task` and `args arch.SyscallArguments`. 
+A `Task` represents an execution thread in an un-trusted app. This includes thread-specific state such as registers.
+`SyscallArguments` include the length of the memory region requested and a pointer to the memory. These arguments will later be stored in an `MMapOpts` object inside `MMap()`.
+
+From here, `MMap()` is invoked in Sentry.
+
+``` go
+// Line 75 of syscalls.go
+func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostarch.Addr, error) {
+```
+This function takes in `Context`, which represents the thread of execution, as well as the `MMapOpts` that was created in the previous function.
+
+Inside of `MMap()`, `createVMALocked` is called on line 122 which is where a new VMA is allocated.
+
+``` go
+// Line 33 of vma.go
+func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOpts) (vmaIterator, hostarch.AddrRange, error) {
+
+    // ...
+    // Line 38
+
+    // Find a usable range.
+    addr, err := mm.findAvailableLocked(opts.Length, findAvailableOpts{
+        Addr:     opts.Addr,
+        Fixed:    opts.Fixed,
+        Unmap:    opts.Unmap,
+        Map32Bit: opts.Map32Bit,
+    })
+
+    // ...
+    // Line 55    
+
+    // Check against RLIMIT_AS.
+    newUsageAS := mm.usageAS + opts.Length
+    if opts.Unmap {
+        newUsageAS -= uint64(mm.vmas.SpanRange(ar))
+    }
+    if limitAS := limits.FromContext(ctx).Get(limits.AS).Cur; newUsageAS > limitAS {
+        return vmaIterator{}, hostarch.AddrRange{}, syserror.ENOMEM
+    }
+
+    if opts.MLockMode != memmap.MLockNone {
+        // Check against RLIMIT_MEMLOCK.
+        if creds := auth.CredentialsFromContext(ctx); !creds.HasCapabilityIn(linux.CAP_IPC_LOCK, creds.UserNamespace.Root()) {
+            mlockLimit := limits.FromContext(ctx).Get(limits.MemoryLocked).Cur
+            if mlockLimit == 0 {
+                return vmaIterator{}, hostarch.AddrRange{}, syserror.EPERM
+            }
+            newLockedAS := mm.lockedAS + opts.Length
+            if opts.Unmap {
+                newLockedAS -= mm.mlockedBytesRangeLocked(ar)
+            }
+            if newLockedAS > mlockLimit {
+                return vmaIterator{}, hostarch.AddrRange{}, syserror.EAGAIN
+            }
+        }
+    }
+
+    // ...
+}
+```
+
+`createVMALocked()` finds a mappable region of memory to allocate. One of the important check is to see if the `Context` has access to this region and can allocate more memory.
+
+#### Tradeoffs of gVisor's Memory Allocation
+Due to the double level page table system, applications requesting small pieces of memory (relative to the size requested from the host by Sentry) suffer in performace. As the size of the memory requested by an application increases, the performance increases. However, it should be noted that memory allocation of any size is not very fast in gvisor relative native Linux containers.
+
 ### Blending Containers and Virtual Machines: A Study of Firecracker and gVisor - Anjali, et al.
 
 This next [paper](research/performance-res/blending-containers-vms-anjali.pdf) studied memory performance differences between native Linux with no isolation, Linux containers, and gVisor (using KVM-mode).
 
-Because of gVisors two level page tables, Sentry requests memory from the host in 16MB chunks in order to reduce the number of `mmap()` calls to the host. When 1GB of memory is requested by the host application, there will be exactly 64 `mmap()` calls to the host. 
+Because of gVisors two level page tables, Sentry requests memory from the host in 16MB chunks in order to reduce the number of `mmap()` calls to the host. When 1GB of memory is requested by the host application, there will be exactly 64 `mmap()` calls to the host.
 
 ![gVisor Memory Allocation](research/performance-res/mem-alloc-time.png)
 
-The test performed called `mmap()` with varying sizes ranging from 4KB to 1MB for a total of 1GB of memory. The results show that when allocating 4KB pieces gVisor performs about 16x slower than host Linux and Linux containers. When allocating 64KB chunks, the gap lessens by almost half and gVisor is only 8-10x slower. 
+The test performed called `mmap()` with varying sizes ranging from 4KB to 1MB for a total of 1GB of memory. The results show that when allocating 4KB pieces gVisor performs about 16x slower than host Linux and Linux containers. When allocating 64KB chunks, the gap lessens by almost half and gVisor is only 8-10x slower.
 In the case of comparing to gVisor, the difference between host Linux and Linux containers is negligble.
 This is an important implication as there is a trend between gVisor's memory allocation performace and the size of the request: as size increases, gVisor's gap to Linux grows smaller. This is likely due to the two-level page table system implemented in gVisor. As an application's memory request grows closer to 16MB, less work in Sentry is being performed to further split that chunk into smaller pieces for the applications running in the sandbox.
 
+### Performace Conclusion
+
+From the studies presented, it is clear that if performance is a concern, gVisor is not a good fit for applications requiring heacy use of syscalls, heavy uses of memory, heavy uses of networking, nor heavy uses of file system accesses. gVisor instead is a good fit for lightweight, serveless applications. Because gVisor does not suffer a significant performance loss in building, deploying, and destroying containers compared to standard Linux containers, secure containers can be quickly created for lightweight applications as needed.
 
 ## Subjective Opinions
 - Sam
