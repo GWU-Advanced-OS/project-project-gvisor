@@ -383,7 +383,7 @@ All memory within a gVisor sandbox is managed by the Sentry using demand-paging 
 
 ### Overview
 
-gVisor’s purpose is to provide a secure container for processes that are assumed to be untrusted – if you did not write it, it is untrusted! Or, at least, that is the philosophy for gVisor. Security in depth allows for the ability to run processes in gVisor without the worry of malicious system call use, troublesome file I/O (thank you, Gofer), and even Linux security vulnerabilities that affect other containers (see: https://gvisor.dev/blog/2020/09/18/containing-a-real-vulnerability/).
+gVisor’s purpose is to provide a secure container for processes that are assumed to be untrusted – if you did not write it, it is untrusted! Or, at least, that is the philosophy for gVisor. Security in depth allows for the ability to run processes in gVisor without the worry of malicious system call use, troublesome file I/O (thank you, Gofer), and even Linux security vulnerabilities that affect other containers: see [here](https://gvisor.dev/blog/2020/09/18/containing-a-real-vulnerability/).
 
 How does gVisor accomplish this level of depth in security? It employs the following mechanisms:
 1.	Re-routing and intercepting system calls from the untrusted process.
@@ -392,6 +392,8 @@ How does gVisor accomplish this level of depth in security? It employs the follo
 4.	Communication between the Sentry and the host via a user-level networking stack.
 5.	File operations provided by Gofer over the 9P protocol.
 
+[Source](https://gvisor.dev/blog/2019/11/18/gvisor-security-basics-part-1/)
+
 ![image info](./research/security-res/fig1.png)
 **Security Fig. 1**
 
@@ -399,7 +401,11 @@ How does gVisor accomplish this level of depth in security? It employs the follo
 
 gVisor ensures that the sandboxed application does not give system calls directly to the host. Threads from the application are tracked, or traced rather, by the Sentry's ptrace implementation. ptrace attaches a tracer to each necessary application thread, as well as all the init() options for the thread's tracking. So, when the application makes a system call, ptrace can redirect over to the Sentry to process the system call, whether that be executing in user level, not allowing the system call at all, or making a call out to the host. In addition to ptrace, the KVM’s ring0 platform ensures that system calls from the application are caught in guest mode and handled accordingly by the supplied system call handler and sent over to the Sentry. See platforms for a more detailed overview of KVM.
 
-The security baton is then handed off to the Sentry to process the system call request. If the call can be done completely in user-level with the implemented system calls in the Sentry, it will do so in order to have unnecessary switches out of user-level. If there needs to be a call out to the host, then the Sentry can do so via the user-level networking stack, the Netstack (more on that later). Lastly, if the system call is not allowed by the Sentry, then it will *not* be performed, but the application will have *no* knowledge of this capability block.
+[Source - ptrace](https://github.com/google/gvisor/blob/master/pkg/sentry/platform/ptrace/subprocess.go#L390)
+
+[Source - ring0](https://github.com/google/gvisor/blob/master/pkg/sentry/platform/ring0/kernel_amd64.go#L182)
+
+The security baton is then handed off to the Sentry to process the system call request. If the call can be done completely in user-level with the implemented system calls in the Sentry, it will do so in order to have unnecessary switches out of user-level. If there needs to be a call out to the host, then the Sentry can do so - the reduced set of whitelisted system calls allows for this to be less of an attack surface. Lastly, if the system call is not allowed by the Sentry, then it will *not* be performed, but the application will have *no* knowledge of this capability block.
 
 Let us look at some examples.
 
@@ -431,6 +437,10 @@ func (t *thread) attach() {
 
 This code excerpt shows the logic for checking a system call for whether it is being tracked, needs to be run in user-level, or can be invoked.
 
+[ptraceSyscallEnter in repo](https://github.com/google/gvisor/blob/master/pkg/sentry/kernel/ptrace.go#L706)
+
+[doSyscallEnter in repo](https://github.com/google/gvisor/blob/master/pkg/sentry/kernel/task_syscall.go#L195)
+
 ```go
 // gvisor/pkg/sentry/kernel/ptrace.go
 
@@ -457,7 +467,7 @@ func (t *Task) ptraceSyscallEnter() (taskRunState, bool) {
 	panic(fmt.Sprintf("Unknown ptraceSyscallMode: %v", t.ptraceSyscallMode))
 }
 
-// ...
+// teleporting...
 
 // gvisor/pkg/sentry/kernel/task_syscall.go
 
@@ -472,7 +482,12 @@ func (t *Task) doSyscallEnter(sysno uintptr, args arch.SyscallArguments) taskRun
 
 Like mentioned previously, if the thread does not have the proper privilege to perform a capability, then it will not allow the action, but it will still look like there is an implementation for the system call to the callee.
 
+[CapError in repo](https://github.com/google/gvisor/blob/master/pkg/sentry/syscalls/syscalls.go#L94)
+
 ```go
+
+// gvisor/pkg/sentry/syscalls/syscalls.go
+
 // CapError gives a syscall function that checks for capability c.  If the task
 // has the capability, it returns ENOSYS, otherwise EPERM. To unprivileged
 // tasks, it will seem like there is an implementation.
@@ -502,6 +517,8 @@ func CapError(name string, c linux.Capability, note string, urls []string) kerne
 The sentry has its own implementation of all whitelisted system calls - the sentry only is allowed a subset of all possible system calls. 51 to be exact, which can all be found in the “gvisor/pkg/sentry/syscalls/linux” directory. This reduced set of system calls allows for a smaller attack surface. The fewer system calls there are, the fewer possibilities there are for an attacker to pass malicious arguments or perform other exploits. This is also assisted by the many layers that are present from when the contained application makes the call, to when the call is invoked, if ever. All of this seems expensive though, doesn't it? Well, it is. gVisor even acknowledges in its documentation that if your contained application needs to make many system calls, there will be a significant performance hit. This is due to the necessity of tracing the system calls and applications for security - without that, the security model is significantly reduced. In KVM mode in contrast with ptrace, there is less overhead but more compatibility issues, so as with most other things, performance is not free.
 
 And here is an example of a whitelisted system call in the Sentry. It is an individual implementation of Linux's pipe(2) system call.
+
+[pipe2 in repo](https://github.com/google/gvisor/blob/master/pkg/sentry/syscalls/linux/vfs2/pipe.go#L42)
 
 ```go
 // pipe2 implements the actual system call with flags.
@@ -539,16 +556,87 @@ func pipe2(t *kernel.Task, addr hostarch.Addr, flags uint) (uintptr, error) {
 
 ### Netstack communication between the Sentry and the host
 
-The use of a virtualized networking device in the Sentry to communicate with the host if a system call is needed adds to the levels of defense that gVisor is attempting to provide. In addition, the user space networking stack allows for gVisor to implement networking capabilities with the reduced set of system calls. This is done with use of only three additional system calls. If, however, more performance is required for networking, the contained application may use passthrough mode, which allows for use of the host’s network stack implementation. Why not always use this? More performance is better, right? There is a tradeoff! Surprise, surprise, the increased performance of passthrough necessitates more whitelisted system calls, including increased file I/O like creating file descriptors, greatly increasing the attack surface of gVisor. So, the general trend continues for less performance = more security.
+The use of a virtualized networking device in the Sentry to communicate with the host if a system call is needed adds to the levels of defense that gVisor is attempting to provide. In addition, the user space networking stack allows for gVisor to implement networking capabilities with the reduced set of system calls. This is done with use of only three additional system calls. If, however, more performance is required for networking, the contained application may use passthrough mode, which allows for use of the host’s network stack implementation. Why not always use this? More performance is better, right? There is a tradeoff! Surprise, surprise, the increased performance of passthrough necessitates more whitelisted system calls, including increased file I/O like creating file descriptors, greatly increasing the attack surface of gVisor. This is due to the need for more system calls when using the host's networking stack to utilize all of the host's API. So, the general trend continues for less performance = more security.
 
+[Source - netstack](https://gvisor.dev/blog/2020/04/02/gvisor-networking-security/)
 
 ![image info](./research/security-res/fig2.png)
+
+[Connect in repo](https://github.com/google/gvisor/blob/e3a5da8ce62826f56c0b531590bb472ea717eeac/pkg/sentry/socket/netstack/netstack.go#L545)
+
+And here is an example of the connect Linux syscall in userlevel netstack implementation
+
+```go
+
+// gvisor/pkg/sentry/socket/netstack/netstack.go#L545
+
+// Connect implements the linux syscall connect(2) for sockets backed by
+// tpcip.Endpoint.
+func (s *socketOpsCommon) Connect(t *kernel.Task, sockaddr []byte, blocking bool) *syserr.Error {
+	addr, family, err := socket.AddressAndFamily(sockaddr)
+	if err != nil {
+		return err
+	}
+
+	if family == linux.AF_UNSPEC {
+		err := s.Endpoint.Disconnect()
+		if _, ok := err.(*tcpip.ErrNotSupported); ok {
+			return syserr.ErrAddressFamilyNotSupported
+		}
+		return syserr.TranslateNetstackError(err)
+	}
+
+	if err := s.checkFamily(family, false /* exact */); err != nil {
+		return err
+	}
+	addr = s.mapFamily(addr, family)
+
+	// Always return right away in the non-blocking case.
+	if !blocking {
+		return syserr.TranslateNetstackError(s.Endpoint.Connect(addr))
+	}
+
+	// Register for notification when the endpoint becomes writable, then
+	// initiate the connection.
+	e, ch := waiter.NewChannelEntry(nil)
+	s.EventRegister(&e, waiter.WritableEvents)
+	defer s.EventUnregister(&e)
+
+	switch err := s.Endpoint.Connect(addr); err.(type) {
+	case *tcpip.ErrConnectStarted, *tcpip.ErrAlreadyConnecting:
+	case *tcpip.ErrNoPortAvailable:
+		if (s.family == unix.AF_INET || s.family == unix.AF_INET6) && s.skType == linux.SOCK_STREAM {
+			// TCP unlike UDP returns EADDRNOTAVAIL when it can't
+			// find an available local ephemeral port.
+			return syserr.ErrAddressNotAvailable
+		}
+		return syserr.TranslateNetstackError(err)
+	default:
+		return syserr.TranslateNetstackError(err)
+	}
+
+	// It's pending, so we have to wait for a notification, and fetch the
+	// result once the wait completes.
+	if err := t.Block(ch); err != nil {
+		return syserr.FromError(err)
+	}
+
+	// Call Connect() again after blocking to find connect's result.
+	return syserr.TranslateNetstackError(s.Endpoint.Connect(addr))
+}
+```
 
 **Security Fig. 2**
 
 ### Gofer
 
-Another layer of the security model is the separation between the Sentry and file operations. The Sentry is able to have Gofer service its requests for file operations via 9P. In the interest of not adding more length to this novella, I will link [here for more Gofer explanation.](https://github.com/GWU-Advanced-OS/project-project-gvisor/blob/main/report.md#gofer)
+Another layer of the security model is the separation between the Sentry and file operations. The Sentry is able to have Gofer service its requests for file operations via 9P. The Sentry is not allowed to directly interact with the filesystem, and is in a constrained namespace. But what if it needs a file? The Sentry can communicate with Gofer via a socket with the 9P protocol and Gofer handles the file requests. In the interest of not adding more length to this novella, I will link [here for a more in-depth Gofer explanation.](https://github.com/GWU-Advanced-OS/project-project-gvisor/blob/main/report.md#gofer)
+
+### Security Conclusion
+
+gVisor is able to acheive the level of security it has due to its many layers of defense, secure-by-default principle, and persistant assumption that the contained application is untrusted. The layers, consisting of limited system calls, restriction of file resource access, individual system call implementations, and the intercepting of application system calls, all contribute to the security-in-depth principle. They provide insurance for if the application is able to bypass one measure, another will be there to slow attacks down, or minimize the available attack surface in general. The secure-by-default principle can be seen in the choice to implement and use the user-level networking stack in the Sentry, opposed to the host's in passthrough mode, by default. Lastly, having all modules use the least priviledge possible ensures separation, as well as modules not having access to functionality that would increase the attack surface or vunerabilities, i.e. the container not being able to directly open fd's. If one module needs to perform a task that they are not able to perform, then there is a more trusted module to service the request. 
+
+![image info](./research/security-res/fig3.png)
 
 ## Performance / Optimizations
 
