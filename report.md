@@ -560,18 +560,18 @@ In looking at the performance of gVisor, it is important to look at five main be
 4. File system access
 5. Networking
 
-An important point that must be discussed before comparing the performance of gVisor is which platform is used to handle system calls made to the host. The first is *Kernel Virtual Mode (KVM)* which allows Linux itself to act as hypervisor by providing a loadable kernel module. The other option is *ptrace* which allows a process to intercept a system call being called.
+An important point that must be discussed before comparing performance is which platform is used to handle system calls. The first option is *Kernel Virtual Mode (KVM)* which allows Linux itself to act as hypervisor by providing a loadable kernel module. The other option is *ptrace* which allows a process to intercept system calls being called.
 It should be noted that ptrace [suffers from the highest structural costs by far](https://gvisor.dev/docs/architecture_guide/performance/).
 
 ### The True Cost of Contanerization - Ethan G. Young, et al.
 
-A [paper written by Ethan G. Young, et al. at the Univeristy of Wisconsin](research/performance-res/true-cost-containing-young.pdf) ran experiments running runc against runsc in both ptrace and KVM mode. Their study examined the two systems in the five different benchmarks discussed previously.
+A [paper written by Ethan G. Young, et al. at the Univeristy of Wisconsin](research/performance-res/true-cost-containing-young.pdf) ran experiments running `runc` against `runsc` in both ptrace and KVM mode. Their study examined the two systems in the five different benchmarks discussed previously.
 
 #### Container Startup/Tear Down
 
 ![Container Startup/Tear Down Results](research/performance-res/young-cont-init.png)
 
-The results suggest that the differences between running gVisor with ptrace versus KVM for container initialization is neglible. In the context of runc however, there is about a 13% decrease in performance between runc and runsc. Although Google claims that gVisor is designed use in machines with many containers, these results suggest that runc still has an edge here.
+The results suggest that the differences between running gVisor with ptrace versus KVM for container initialization is neglible. In the context of runc however, there is about a 13% decrease in performance between runc and runsc. Although Google claims that gVisor is designed for use in machines with many containers, these results suggest that runc still has a slight edge.
 
 #### System Call Throughput
 
@@ -579,7 +579,7 @@ In order to test the system call performace of gVisor, three versions of the sam
 
 ![System Call Throughput Results](research/performance-res/young-syscall.png)
 
-The implication here is that even in gVisor's best case (running in KVM and only calling Sentry), the performance is still 2.8x slower. It is also clear from the results that calling to Gofer suffers from the worst performance. Compared to runc, Gofer runs between 156x and 175x slower depeding on the platform.
+The implication here is that even in gVisor's best case (running in KVM and only calling Sentry), the performance is still 2.8x slower. It is also clear from the results that calling to Gofer suffers from the worst performance. Compared to runc, Gofer runs between 156x and 175x slower depending on the platform.
 
 #### Memory Allocation
 
@@ -595,7 +595,7 @@ As previously discussed, Gofer suffers from the largest performance tradeoff. Th
 
 #### Networking
 
-gVisor uses its own network stack in order to safely and securely handle all networking down. This is one area in particular that [Google claims "is improving quickly"](https://gvisor.dev/docs/architecture_guide/performance/#network).
+gVisor uses its own network stack in order to safely and securely handle all networking. This is one area in particular that [Google claims "is improving quickly"](https://gvisor.dev/docs/architecture_guide/performance/#network).
 To test networking throughput, `wget` was called for file sizes of various sizes.
 
 ![Networking Results](research/performance-res/young-network.png)
@@ -628,8 +628,8 @@ You can see an interesting Go optimization here where the fast path assumes the 
 
 ### Security-Performance Trade-offs of Kubernetes Container Runtimes - Viktorsson, et al.
 
-Another [study](research/performance-res/security-performace-tradeoffs-viktorsson.pdf) attempted to measure the performace of gVisor in more real world applications rather. All tests run in this study used the pTrace platform.
-Three different application's total throughput were tested:
+Another [study](research/performance-res/security-performace-tradeoffs-viktorsson.pdf) attempted to measure the performace of gVisor in more real world applications. All tests run in this study used the ptrace platform.
+Three different application's total throughput was tested:
 
 1. **TeaStore:**
 
@@ -637,7 +637,7 @@ Three different application's total throughput were tested:
 
 2. **Redis:**
 
-- Redis is an in memory data-store featuring data structures such as hashes, lists, sets, and more. The throughput is measure using requests per second of the O(1) GET operation.
+- Redis is an in memory data-store featuring data structures such as hashes, lists, sets, and more. The throughput is measure using requests per second of the `O(1) GET` operation.
 
 3. **Spark:**
 
@@ -645,7 +645,7 @@ Three different application's total throughput were tested:
 
 ![Teastore-Redis-Spark Results](research/performance-res/redis-spark-teastore-experiment.png)
 
-In testing TeaStore and Spark, gVisor has about 40-60% the throughput of runc. For Redis, it suffers dramtically at just 20% the throughput of runc. The poor performace in Redis is likely due to the fact that it is neither CPU nor memory demanding and thus its performance is based solely on the GET request to in-memory data. This suggests that Redis performance is largely based on networking throughput.
+In testing TeaStore and Spark, gVisor has about 40-60% the throughput of runc. For Redis, it suffers dramtically at just 20% the throughput of runc. The poor performace in Redis is likely due to the fact that it is neither CPU nor memory demanding and thus its performance is based solely on the `GET` request to in-memory data. This suggests that Redis performance is largely based on networking throughput.
 
 ### A Deeper Look into Memory Allocation in gVisor
 
@@ -653,7 +653,7 @@ gVisor's memory allocation system involves a two-level physical to virtual mappi
 
 #### From Host to Sentry
 
-First we'll look at the sequence of code that allows Sentry to get memory from the host OS. `Allocate()` returns a `MemoryFile` which is a mapping of a chunk of memory from the host. This is the struct that Sentry will later use to find available pages of memory to allocate to an application.
+First we'll look at the sequence of code that allows Sentry to get memory from the host OS. `Allocate()` updates a `MemoryFile` which is a mapping of a chunk of memory from the host. This is the struct that Sentry will later use to find available pages of memory to allocate to an application.
 
 ```go
 // Line 381 of pgalloc.go
@@ -770,32 +770,34 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 }
 ```
 
-`createVMALocked()` finds a mappable region of memory to allocate. One of the important check is to see if the `Context` has access to this region and can allocate more memory.
+`createVMALocked()` finds a mappable region of memory to allocate. One of the important checks is to see if the `Context` has access to this region and can allocate more memory.
 
 #### Tradeoffs of gVisor's Memory Allocation
-Due to the double level page table system, applications requesting small pieces of memory (relative to the size requested from the host by Sentry) suffer in performace. As the size of the memory requested by an application increases, the performance increases. However, it should be noted that memory allocation of any size is not very fast in gvisor relative native Linux containers.
+Due to the two level page table system, applications requesting small pieces of memory (relative to the size requested from the host by Sentry) suffer in performace. As the size of the memory requested by an application increases, the performance increases because less work in Sentry must be done to further divide the 16MB chunk from the host OS.
+However, it should be noted that memory allocation of any size is not very fast in gvisor relative to native Linux containers.
 
 ### Blending Containers and Virtual Machines: A Study of Firecracker and gVisor - Anjali, et al.
 
 This next [paper](research/performance-res/blending-containers-vms-anjali.pdf) studied memory performance differences between native Linux with no isolation, Linux containers, and gVisor (using KVM-mode).
 
-Because of gVisors two level page tables, Sentry requests memory from the host in 16MB chunks in order to reduce the number of `mmap()` calls to the host. When 1GB of memory is requested by the host application, there will be exactly 64 `mmap()` calls to the host.
+Because of gVisor's two level page tables, Sentry requests memory from the host in 16MB chunks in order to reduce the number of `mmap()` calls to the host. When 1GB of memory is requested by the host application, there will be exactly 64 `mmap()` calls to the host.
 
 ![gVisor Memory Allocation](research/performance-res/mem-alloc-time.png)
 
 The test performed called `mmap()` with varying sizes ranging from 4KB to 1MB for a total of 1GB of memory. The results show that when allocating 4KB pieces gVisor performs about 16x slower than host Linux and Linux containers. When allocating 64KB chunks, the gap lessens by almost half and gVisor is only 8-10x slower.
 In the case of comparing to gVisor, the difference between host Linux and Linux containers is negligble.
+
 This is an important implication as there is a trend between gVisor's memory allocation performace and the size of the request: as size increases, gVisor's gap to Linux grows smaller. This is likely due to the two-level page table system implemented in gVisor. As an application's memory request grows closer to 16MB, less work in Sentry is being performed to further split that chunk into smaller pieces for the applications running in the sandbox.
 
 ### Performace Conclusion
 
-From the studies presented, it is clear that if performance is a concern, gVisor is not a good fit for applications requiring heacy use of syscalls, heavy uses of memory, heavy uses of networking, nor heavy uses of file system accesses. gVisor instead is a good fit for lightweight, serveless applications. Because gVisor does not suffer a significant performance loss in building, deploying, and destroying containers compared to standard Linux containers, secure containers can be quickly created for lightweight applications as needed.
+From the studies presented, it is clear that if performance is a concern, gVisor is not a good fit for applications requiring heavy use of syscalls, heavy use of memory, heavy use of networking, nor heavy use of file system accesses. gVisor instead is a good fit for lightweight, serveless applications. Because gVisor does not suffer a significant performance loss in building, deploying, and destroying containers compared to standard Linux containers, secure containers can be quickly created for lightweight applications as needed.
 
 ## Subjective Opinions
 - Sam
 - Jake
 - Jack
-  - gVisor's lack of performance in many areas is certainily a large pill to swallow on first look comparing it to native Linux Containers. However, if security is of utmost concern, then the many tradeofs made in gVisor soon become worth it. The two-level memory allocation system is a clever way of reducing the number of calls needed to be made down to the host OS. Allowing Sentry to request memory in chunks allows gVisor's footprint to remain small when low amounts of memory are required by an application. It would be interesting to see how the size of the chunks requested by Sentry affects overall performance. 
+  - gVisor's lack of performance in many areas is certainily a large pill to swallow on first look comparing it to native Linux Containers. However, if security is of utmost concern, then the many tradeofs made in gVisor soon become worth it. The two-level memory allocation system is a clever way of reducing the number of calls needed to be made down to the host OS. Allowing Sentry to request memory in chunks allows gVisor's footprint to remain small when low amounts of memory are required by an application. It would be interesting to see how the size of the chunks requested by Sentry affects overall performance. Would dynamically increasing or decreasing the 16MB chunk based on the expected use of the container have a significant effect on performance?
 - Will
   - gVisor is a very secure container implementation with many layers of defense in depth, and it shows (preventing security vulnerabilities that docker, for example, was subsceptible to). However, there is a consequential and significant performance hit. I don't necessarily think this is a nail in the coffin, though. To acheive the level of security that gVisor was intending to reach, there are necessary tradeoffs that had to be made - like tracing all system calls and redirecting to be intercepted. That simply cannot be cheap no matter which way you look at it. But that is not the point of gVisor. The core component is security, and it does it very well.
 - Jon
