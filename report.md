@@ -23,7 +23,8 @@ Diagram of overlayfs:
 
 ![overlayfs_diagram](research/overlay_constructs.jpg)
 
-The above image shows three layers. The bottom layer is the root directory of the application to be run and sandboxed by gVisor. This is called the `lowerdir` and represents the base image the container will mount. The `upperdir` holds the container's bundled file directory with all of its code. The container is mounted on `merged` which is the overlay layer. `merged` appears to be a full image/filesystem with all of its own code to the container. The `lowerdir` layer is readonly and changes here will not change the actualy base image stored on the host. Changing or adding files to the `lowerdir` will create a copy of the file in the `upperdir` and changes are stored there. Deletions are implemented with whiteout files/directories that are transparently stored in the overlay layer. Changes to the `upperdir` can take place as normal. This copy-on-write feature is useful because the container can use the image at will without having to copy the entire directory into a new sandboxed filesystem (See this [paper](https://www.usenix.org/system/files/hotstorage19-paper-koller.pdf) discussing overlay filesystems in a container context).
+The above image shows three layers. The bottom layer is the root directory of the application to be run and sandboxed by gVisor. This is called the `lowerdir` and represents the base image the container will mount. The `upperdir` holds the container's bundled file directory with all of its code. The container is mounted on `merged` which is the overlay layer. `merged` appears to be a full image/filesystem with all of its own code to the container. The `lowerdir` layer is readonly and changes here will not change the actualy base image stored on the host. Changing or adding files to the `lowerdir` will create a copy of the file in the `upperdir` and changes are stored there. Deletions are implemented with whiteout files/directories that are transparently stored in the overlay layer. Changes to the `upperdir` can take place as normal. This copy-on-write feature is useful because the container can use the image at will without having to copy the entire directory into a new sandboxed filesystem.
+Sources:  [paper discussing overlayfs in containers](https://www.usenix.org/system/files/hotstorage19-paper-koller.pdf), [kernel docs](https://www.kernel.org/doc/html/latest/filesystems/overlayfs.html)
 
 ```
 // line 39 in gvisor/runsc/cmd/gofer.go
@@ -71,6 +72,8 @@ if err := unix.Unmount(".", unix.MNT_DETACH); err != nil {
     return fmt.Errorf("error umounting the old root file system: %v", err)
 }
 ```
+Source: [gvisor/runsc/cmd/chroot.go](https://github.com/google/gvisor/blob/master/runsc/cmd/chroot.go)
+
 After setting up the root of the filesystem, the rest of any subsequent mounts necessary for the container's execution are mounted in the correct location under the new root. The next step is to use change directories to the new `/proc` and call `pivotRoot()`. This changes the root of the Gofer process's filesystem namespace and then unmounts the old root. Lastly, Gofer uses `chroot` to further isolate the processes root one more subdirectory to `/root` (because `/proc/root` just turned into `/root` in the process's namespace). Now the process sees `/root` as `/`, it's own image, containing all code needed to execute, completely isolated from the host OS.
 
 #### Process limitations
@@ -86,6 +89,8 @@ var caps = []string{
 	"CAP_SYS_CHROOT",
 }
 ```
+Source: [gvisor/runsc/cmd/gofer.go](https://github.com/google/gvisor/blob/master/runsc/cmd/gofer.go)
+
 Next it uses seccomp and BPF filters to limit the system calls available to the process. Similarly to the applied capabilities, Gofer whitelists only the system calls required for execution, thus limiting the attack surface for the process.
 
 #### Server Model
@@ -113,6 +118,8 @@ func runServers(ats []p9.Attacher, ioFDs []int) {
 	log.Infof("All 9P servers exited.")
 }
 ```
+Source: [gvisor/runsc/cmd/gofer.go](https://github.com/google/gvisor/blob/master/runsc/cmd/gofer.go)
+
 As shown above, to begin, the gofer creates one goroutine per client connection and calls `Handle()`. `Handle()` creates a connection state for the given connection and calls `handleRequests()`. This method is a simple wrapper that just infinitely calls `handleRequest()` until an error is thrown or the goroutine receives the shutdown signal (i.e. another goroutine detected a connection problem). `handleRequest()` "handles" the main logic of dealing with client connections. The first step is to receive the client request.
 ```
 // Line 121 - ReadVec() in gvisor/pkg/unet/unet_unsafe.go
@@ -129,6 +136,8 @@ for {
     ... error handling ...
 }
 ```
+Source: [gvisor/pkg/unet/unet_unsafe.go](https://github.com/google/gvisor/blob/master/pkg/unet/unet_unsafe.go)
+
 Gofer will attempt to use a non-blocking receive first, and will only block if there is no data incoming. This allows the runtime to be given up when the client isn't currently requesting anything. When there is more traffic on the stream however, the non-blocking receive will handle client requests immediately. This all takes place within a critical section which is entered by taking the receive mutex on the client connection struct, as shown below:
 ```
 // line 518 in gvisor/pkg/p9/server.go
@@ -145,6 +154,8 @@ if atomic.LoadInt32(&cs.recvIdle) == 0 {
 }
 cs.recvMu.Unlock()
 ```
+Source: [gvisor/pkg/p9/server.go](https://github.com/google/gvisor/blob/master/pkg/p9/server.go)
+
 If `recvIdle` is zero, that means that no goroutines on the given client state (`cs`) are waiting for the mutex. So Gofer spawns another goroutine on the same `cs` to recieve the next message while it handles the current one. If there is one waiting for the mutex, it will be able to receive the next message as soon as the current one releases the mutex. Assuming the goroutines can quickly process and send responses to the clients, this thread pool will never grow too large and will simply reuse the same small set of goroutines per connection.
 
 Handling the request and performing an operation.
@@ -158,9 +169,11 @@ cs.sendMu.Lock()
 err = send(cs.conn, tag, r)
 cs.sendMu.Unlock()
 ```
+Source: [gvisor/pkg/p9/server.go](https://github.com/google/gvisor/blob/master/pkg/p9/server.go)
+
 To actually handle the request and perform some filesystem operation, `cs.handle()` is called with the received message. The action depends on the message, so the message handler function implements the handler interface shown below to carry out the appropriate action. Some different options are also shown below.
 
-line 68 in gvisor/pkg/p9/handlers.go
+line 68 in [gvisor/pkg/p9/handlers.go](https://github.com/google/gvisor/blob/master/pkg/p9/handlers.go)
 ![handler interface](research/handler_interface.png)
 
 For example, a `Tread` request carries out a read request and returns the data requested. A `Twrite` request will carry out a write and return the number of bytes successfully written. Whatever is returned in `r` is then sent back to the client to complete this interaction.
@@ -691,7 +704,9 @@ To test networking throughput, `wget` was called for file sizes of various sizes
 The results show that gVisor may handle small downloads well, relative to native performance, but as file sizes increase, gVisor fails to scale well.
 
 #### Threading model
-[Goroutines](https://tour.golang.org/concurrency/1) are lightweight threads managed by the Go runtime. Within gVisor's [resource model documentation](https://gvisor.dev/docs/architecture_guide/resources/), it is explained that gvisor uses lightweight "green threads". This is used for individual Sentry tasks and the Gofer server model. See this [paper](https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.8.9238&rep=rep1&type=pdf) comparing Linux Threads to Green Threads. This paper explains green threads in the Java runtime but the concept applies here as well for the Go runtime. Green threads are a userspace thread implementation that don't need a backing kernel thread. In this model, green threads are mapped to a single task and can be managed with little overhead. This is in contrast to the system calls required with linux threads. Thread activation also takes less overhead because Linux threads must create a corresponding execution entity within the kernel. When latency is important for an application, it is recommended for threads to be created at initialization rather than on demand. This explains the use of goroutines rather than native Linux threads throughout gVisor.
+Goroutines are lightweight "green threads" managed by the Go runtime. These are used for individual Sentry tasks and the Gofer server model. See this [paper](https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.8.9238&rep=rep1&type=pdf) comparing Linux Threads to Green Threads. This paper explains green threads in the Java runtime but the concept applies here as well for the Go runtime. Green threads are a userspace thread implementation that don't need a backing kernel thread. In this model, green threads are mapped to a single task and can be managed with little overhead. This is in contrast to the system calls required with linux threads. Thread activation also takes less overhead because Linux threads must create a corresponding execution entity within the kernel. When latency is important for an application, it is recommended for threads to be created at initialization rather than on demand. This explains the use of goroutines rather than native Linux threads throughout gVisor.
+Sources: [Goroutines](https://tour.golang.org/concurrency/1), [resource model documentation](https://gvisor.dev/docs/architecture_guide/resources/)
+
 
 #### Gofer Server Synchronization
 The below code `Lock()` function is the function used (as discussed above in the Gofer module) line 519 of gvisor/pkg/p9/server.go.
@@ -711,6 +726,8 @@ func (m *Mutex) Lock() {
 	m.lockSlow()
 }
 ```
+Source: [go/src/sync/mutex.go](https://golang.org/src/sync/mutex.go)
+
 You can see an interesting Go optimization here where the fast path assumes the mutex is free and inlines that logic in the function. If the mutex is taken, `lockSlow()` is implemented in a different function because the blocking mechanism takes more logic and is therefore slow pathed.
 
 
@@ -883,7 +900,9 @@ From the studies presented, it is clear that if performance is a concern, gVisor
 
 ## Subjective Opinions
 - Sam
+	- gVisor is a really cool solution to a specific problem. It's great at its stated goal, providing a secure sandbox for testing untrusted code. In doing so, there are some substantial tradeoffs. Perfomance is slow, but in this case, I think that's ok given the level of security provided. I found the use of the separately sandboxed Gofer for file access to be a very interesting way to protect host files. I am most curious if communication with Gofer could be further optimized to improve performance.
 - Jake
+  - While gVisor certainly doesn't have the greatest performance for many usecases, I think its a good first step towards securing cloud infrastructure. Maybe right now it can only be feasible for serverless frameworks (as designed), it could eventually evolve or motivate a higher performing implementation that could work for larger and more diverse workloads. Even as is, it could be extremely useful for any application if you could just offload the most critically sensitive logic to gVisor. I think security is often traded for performance but it's great to see a project with security as the number one goal. Given time and effort, gVisor and similar projects can get faster. I feel like this is a better route to take than trying to constantly patch new security vulnerabilities in a fast system. I also really like that the language is written in Go rather than C because many existing Linux vulnerabilities come about from problematic C code and I'm excited to see the relatively young Golang evolve further.
 - Jack
   - gVisor's lack of performance in many areas is certainily a large pill to swallow on first look comparing it to native Linux Containers. However, if security is of utmost concern, then the many tradeofs made in gVisor soon become worth it. The two-level memory allocation system is a clever way of reducing the number of calls needed to be made down to the host OS. Allowing Sentry to request memory in chunks allows gVisor's footprint to remain small when low amounts of memory are required by an application. It would be interesting to see how the size of the chunks requested by Sentry affects overall performance. Would dynamically increasing or decreasing the 16MB chunk based on the expected use of the container have a significant effect on performance?
 - Will
