@@ -795,6 +795,7 @@ From the studies presented, it is clear that if performance is a concern, gVisor
 
 ## Subjective Opinions
 - Sam
+	- gVisor is a really cool solution to a specific problem. It's great at its stated goal, providing a secure sandbox for testing untrusted code. In doing so, there are some substantial tradeoffs. Perfomance is slow, but in this case, I think that's ok given the level of security provided. I found the use of the separately sandboxed Gofer for file access to be a very interesting way to protect host files. I am most curious if communication with Gofer could be further optimized to improve performance.
 - Jake
 - Jack
   - gVisor's lack of performance in many areas is certainily a large pill to swallow on first look comparing it to native Linux Containers. However, if security is of utmost concern, then the many tradeofs made in gVisor soon become worth it. The two-level memory allocation system is a clever way of reducing the number of calls needed to be made down to the host OS. Allowing Sentry to request memory in chunks allows gVisor's footprint to remain small when low amounts of memory are required by an application. It would be interesting to see how the size of the chunks requested by Sentry affects overall performance. Would dynamically increasing or decreasing the 16MB chunk based on the expected use of the container have a significant effect on performance?
