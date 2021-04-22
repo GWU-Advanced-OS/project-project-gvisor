@@ -402,8 +402,7 @@ How does gVisor accomplish this level of depth in security? It employs the follo
 1.	Re-routing and intercepting system calls from the untrusted process.
 2.	Individual implementations of Linux system calls in the Sentry.
 3.	Reduced set of whitelisted system calls allowed for the Sentry.
-4.	Communication between the Sentry and the host via a user-level networking stack.
-5.	File operations provided by Gofer over the 9P protocol.
+4.	File operations provided by Gofer over the 9P protocol.
 
 [Source](https://gvisor.dev/blog/2019/11/18/gvisor-security-basics-part-1/)
 
@@ -418,7 +417,7 @@ gVisor ensures that the sandboxed application does not give system calls directl
 
 [Source - ring0](https://github.com/google/gvisor/blob/master/pkg/sentry/platform/ring0/kernel_amd64.go#L182)
 
-The security baton is then handed off to the Sentry to process the system call request. If the call can be done completely in user-level with the implemented system calls in the Sentry, it will do so in order to have unnecessary switches out of user-level. If there needs to be a call out to the host, then the Sentry can do so - the reduced set of whitelisted system calls allows for this to be less of an attack surface. Lastly, if the system call is not allowed by the Sentry, then it will *not* be performed, but the application will have *no* knowledge of this capability block.
+The security baton is then handed off to the Sentry to process the system call request. If the call can be done completely in user-level with the implemented system calls in the Sentry, it will do so in order to have unnecessary switches out of user-level. If there needs to be a call out to the host, then the Sentry can do so - the reduced set of whitelisted system calls allows for this to be less of an attack surface. [Seccomp filters are used for this whitelisting.](https://github.com/GWU-Advanced-OS/project-project-gvisor/blob/main/report.md#process-limitations) Lastly, if the system call is not allowed by the Sentry, then it will *not* be performed, but the application will have *no* knowledge of this capability block.
 
 Let us look at some examples.
 
